@@ -363,6 +363,15 @@ proc sendDisconnect(ctx: MqttCtx): Future[bool] {.async.}
 # ------------------------------------------------------------------------------
 #
 # ------------------------------------------------------------------------------
+when defined(ssl):
+  proc destroySslContext(ctx: MqttCtx) =
+    if not ctx.ssl.isNil:
+      ctx.ssl.destroyContext()
+      ctx.ssl = nil
+
+# ------------------------------------------------------------------------------
+#
+# ------------------------------------------------------------------------------
 proc close(ctx: MqttCtx, reason: string) {.async.} =
   if ctx.state in {Connecting, Connected}:
     ctx.state = Disconnecting
@@ -371,6 +380,8 @@ proc close(ctx: MqttCtx, reason: string) {.async.} =
     discard await ctx.sendDisconnect()
     ctx.s.close()
     ctx.state = Disconnected
+  when defined(ssl):
+    ctx.destroySslContext()
 
 # ------------------------------------------------------------------------------
 #
@@ -1234,6 +1245,7 @@ proc connectBroker(ctx: MqttCtx) {.async.} =
   ctx.s = await asyncnet.dial(ctx.host, ctx.port)
   if ctx.sslOn:
     when defined(ssl):
+      ctx.destroySslContext()
       ctx.ssl = newContext(protSSLv23, CVerifyNone, ctx.sslCert, ctx.sslKey)
       wrapConnectedSocket(ctx.ssl, ctx.s, handshakeAsClient)
     else:
