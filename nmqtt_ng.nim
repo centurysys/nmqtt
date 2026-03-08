@@ -27,6 +27,8 @@ when defined(broker):
 import ./nmqttngpkgs/syslog
 import ./nmqttngpkgs/work_queue
 
+export WorkCallback, PktType
+
 type
   MqttCtx* = ref object
     host: string
@@ -47,6 +49,7 @@ type
     workQueue: WorkQueue
     pingWorkerId: int
     pubCallbacks: Table[string, PubCallback]
+    workCallback: Option[WorkCallback]
     inWork: bool
     isPending: bool
     keepAlive: uint16
@@ -1008,6 +1011,9 @@ proc onPubAck(ctx: MqttCtx, pkt: Pkt) {.async.} =
   ctx.info(&"[MQTT] onPubAck: msgId: {msgId}")
   if ctx.workQueue.contains(msgId):
     discard ctx.workQueue.remove(msgId)
+    if ctx.workCallback.isSome:
+      let cbFunc = ctx.workCallback.get.cb
+      cbFunc(msgId, PubAck)
 
 # ------------------------------------------------------------------------------
 #
@@ -1450,6 +1456,23 @@ proc unsubscribe*(ctx: MqttCtx, topic: string): Future[void] =
   let work = newWork(wk = SubWork, msgId = msgId, topic = topic, typ = Unsubscribe)
   discard ctx.workQueue.enqueue(work)
   result = ctx.work()
+
+# ------------------------------------------------------------------------------
+#
+# ------------------------------------------------------------------------------
+proc registerCallback*(ctx: MqttCtx, callback: WorkCallback.cb): bool =
+  if ctx.workCallback.isSome:
+    return
+  let cb = WorkCallback(cb: callback)
+  ctx.workCallback = some(cb)
+  result = true
+
+# ------------------------------------------------------------------------------
+#
+# ------------------------------------------------------------------------------
+proc unregisterCallback*(ctx: MqttCtx) =
+  if ctx.workCallback.isSome:
+    ctx.workCallback = none(WorkCallback)
 
 # ------------------------------------------------------------------------------
 #

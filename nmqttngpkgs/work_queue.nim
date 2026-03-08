@@ -34,6 +34,8 @@ type
   PubCallback* = object
     cb*: proc(topic: string, message: string)
     qos*: Qos
+  WorkCallback* = object
+    cb*: proc(msgId: uint16, pktType: PktType)
   WorkMeta = object
     createdAt: MonoTime
     lastSentAt: MonoTime
