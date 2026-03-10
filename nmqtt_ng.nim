@@ -50,6 +50,10 @@ type
     pingWorkerId: int
     pubCallbacks: Table[string, PubCallback]
     workCallback: Option[WorkCallback]
+    stateCallback: Option[StateCallback]
+    pState: PublishState
+    pConnected: bool
+    qWatermarks: Watermarks
     inWork: bool
     isPending: bool
     keepAlive: uint16
@@ -95,6 +99,14 @@ type
     flags: uint8
     data: seq[uint8]
   Pkt = ref PktObj
+  Watermarks = object
+    h: int
+    l: int
+  PublishState* = enum
+    psBlocked
+    psReady
+  StateCallback* = object
+    cb*: proc(connected: bool, pState: PublishState)
 
 when defined(broker):
   type
@@ -357,6 +369,28 @@ when defined(broker):
 # ------------------------------------------------------------------------------
 #
 # ------------------------------------------------------------------------------
+proc updatePublishState(ctx: MqttCtx) =
+  var nextState = ctx.pState
+  let queued = ctx.workQueue.len()
+  let connected = (ctx.state == Connected)
+  case ctx.pState
+  of psBlocked:
+    if ctx.state != Disabled and queued < ctx.qWatermarks.l:
+      nextState = psReady
+  of psReady:
+    if ctx.state == Disabled or queued >= ctx.qWatermarks.h:
+      nextState = psBlocked
+  if nextState != ctx.pState or connected != ctx.pConnected:
+    ctx.pState = nextState
+    ctx.pConnected = connected
+    let cbOpt = ctx.stateCallback
+    if cbOpt.isSome:
+      let cb = cbOpt.get().cb
+      cb(connected, nextState)
+
+# ------------------------------------------------------------------------------
+#
+# ------------------------------------------------------------------------------
 proc nextMsgId(ctx: MqttCtx): MsgId =
   ctx.msgIdSeq.inc
   return ctx.msgIdSeq
@@ -385,6 +419,7 @@ proc close(ctx: MqttCtx, reason: string) {.async.} =
     ctx.state = Disconnected
   when defined(ssl):
     ctx.destroySslContext()
+  ctx.updatePublishState()
 
 # ------------------------------------------------------------------------------
 #
@@ -527,6 +562,7 @@ proc sendConnect(ctx: MqttCtx): Future[bool] =
   if ctx.password != "":
     pkt.put(ctx.password, true)
   ctx.state = Connecting
+  ctx.updatePublishState()
   result = ctx.send(pkt)
 
 # ------------------------------------------------------------------------------
@@ -908,6 +944,7 @@ proc onConnect(ctx: MqttCtx, pkt: Pkt) {.async.} =
 # ------------------------------------------------------------------------------
 proc onConnAck(ctx: MqttCtx, pkt: Pkt): Future[void] =
   ctx.state = Connected
+  ctx.updatePublishState()
   let (code, _) = pkt.getu8(1)
   if code == 0:
     ctx.beenConnected = true
@@ -1011,6 +1048,7 @@ proc onPubAck(ctx: MqttCtx, pkt: Pkt) {.async.} =
   ctx.info(&"[MQTT] onPubAck: msgId: {msgId}")
   if ctx.workQueue.contains(msgId):
     discard ctx.workQueue.remove(msgId)
+    ctx.updatePublishState()
     if ctx.workCallback.isSome:
       let cbFunc = ctx.workCallback.get.cb
       cbFunc(msgId, PubAck)
@@ -1248,6 +1286,7 @@ proc connectBroker(ctx: MqttCtx) {.async.} =
     ctx.keepAlive = 60
   ctx.info(&"[MQTT] Connecting to {ctx.host}:{ctx.port}...")
   ctx.state = Error # set to Connecting by sendConnect
+  ctx.updatePublishState()
   ctx.s = await asyncnet.dial(ctx.host, ctx.port)
   if ctx.sslOn:
     when defined(ssl):
@@ -1280,6 +1319,7 @@ proc runConnect(ctx: MqttCtx) {.async.} =
         let errmsg = &"! [MQTT] runConnect: failed to connecting, \"{err}\"."
         ctx.error(errmsg)
         ctx.state = Error
+        ctx.updatePublishState()
       # If the client has been disconnect, it is necessary to tell the broker,
       # that we still want to be Subscribed. PubCallbacks still holds the
       # callbacks, but we need to re-Subscribe to the broker.
@@ -1308,6 +1348,29 @@ proc newMqttCtx*(clientId: string, logging = false): MqttCtx =
   result = MqttCtx(clientId: clientId, state: Disconnected)
   result.workQueue = newWorkQueue()
   result.logging = logging
+  # publish queue
+  result.qWatermarks = Watermarks(h: 10, l: 2)
+  result.pState = psBlocked
+
+# ------------------------------------------------------------------------------
+#
+# ------------------------------------------------------------------------------
+proc setQueueWatermarks*(ctx: MqttCtx, highWatermark: int, lowWatermark: int): bool =
+  if lowWatermark < 0 or highWatermark < 0 or highWatermark <= lowWatermark:
+    return
+  ctx.qWatermarks.h = highWatermark
+  ctx.qWatermarks.l = lowWatermark
+  return true
+
+# ------------------------------------------------------------------------------
+#
+# ------------------------------------------------------------------------------
+proc registerStateCallback*(ctx: MqttCtx, cb: proc(connected: bool, publishState:
+    PublishState)): bool =
+  if ctx.stateCallback.isSome:
+    return
+  ctx.stateCallback = some(StateCallback(cb: cb))
+  return true
 
 # ------------------------------------------------------------------------------
 #
@@ -1377,6 +1440,7 @@ proc start*(ctx: MqttCtx) {.async.} =
   ## happens, when the broker is down, but the client will try to reconnect
   ## until the broker is up again.
   ctx.state = Disconnected
+  ctx.updatePublishState()
   asyncCheck ctx.runConnect()
 
 # ------------------------------------------------------------------------------
@@ -1397,6 +1461,7 @@ proc publishId*(ctx: MqttCtx, topic: string, message: string, qos = 0,
       message = message, retain = retain, typ = Publish)
   let res = ctx.workQueue.enqueue(work)
   if res:
+    ctx.updatePublishState()
     await ctx.work()
     result = some(msgId)
 
