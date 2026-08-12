@@ -1025,17 +1025,20 @@ proc onConnect(ctx: MqttCtx, pkt: Pkt) {.async.} =
 # ------------------------------------------------------------------------------
 #
 # ------------------------------------------------------------------------------
-proc onConnAck(ctx: MqttCtx, pkt: Pkt): Future[void] =
+proc onConnAck(ctx: MqttCtx, pkt: Pkt): Future[void] {.async.} =
+  let (code, _) = pkt.getu8(1)
+
+  if code != ConnAcc.uint8:
+    ctx.info(&"[MQTT] onConnAck: connection failed, code: {code}")
+    ctx.cleanupDisconnectedTransport()
+    return
+
   ctx.state = Connected
   ctx.updatePublishState()
-  let (code, _) = pkt.getu8(1)
-  if code == 0:
-    ctx.beenConnected = true
-    ctx.reconnectPolicy.reset()
-    ctx.info("[MQTT] onConnAck: connection established")
-  else:
-    ctx.info(&"[MQTT] onConnAck: connection failed, code: {code}")
-  result = ctx.work()
+  ctx.beenConnected = true
+  ctx.reconnectPolicy.reset()
+  ctx.info("[MQTT] onConnAck: connection established")
+  await ctx.work()
 
 # ------------------------------------------------------------------------------
 #
