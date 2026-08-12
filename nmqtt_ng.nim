@@ -54,6 +54,8 @@ type
     workQueue: WorkQueue
     pingWorkerId: int
     reconnectPolicy: ReconnectPolicy
+    reconnectDelayStartedAt: MonoTime
+    reconnectDelayMs: int
     pubCallbacks: Table[string, PubCallback]
     workCallback: Option[WorkCallback]
     stateCallback: Option[StateCallback]
@@ -454,6 +456,48 @@ when defined(ssl):
     if not ctx.ssl.isNil:
       ctx.ssl.destroyContext()
       ctx.ssl = nil
+
+# ------------------------------------------------------------------------------
+#
+# ------------------------------------------------------------------------------
+proc registerReconnectFailure(ctx: MqttCtx, errorMessage: string) =
+  ## Record a connection failure and schedule the next reconnect attempt.
+  ##
+  ## Connection setup failures are detected by runConnect(), while a rejected
+  ## CONNACK is detected asynchronously by runRx(). Keeping the retry deadline
+  ## in the context lets both paths share the same reconnect policy.
+  let decision = ctx.reconnectPolicy.registerFailure(errorMessage)
+
+  ctx.reconnectDelayStartedAt = getMonoTime()
+  ctx.reconnectDelayMs = decision.delaySec * 1000
+
+  if decision.shouldLog:
+    let suppressed =
+      if decision.suppressedFailures > 0:
+        &"; {decision.suppressedFailures} reconnect failures suppressed"
+      else:
+        ""
+    let errmsg = &"! [MQTT] reconnect failed, \"{errorMessage}\";" &
+        &" retry in {decision.delaySec}s{suppressed}."
+    ctx.error(errmsg)
+
+# ------------------------------------------------------------------------------
+#
+# ------------------------------------------------------------------------------
+proc reconnectDelayRemainingMs(ctx: MqttCtx): int =
+  ## Return the remaining reconnect delay, accounting for time already spent in
+  ## the runConnect polling loop after an asynchronous failure was reported.
+  if ctx.reconnectDelayMs <= 0:
+    return 0
+
+  let elapsedMs = (getMonoTime() - ctx.reconnectDelayStartedAt).inMilliseconds.int
+  result = max(0, ctx.reconnectDelayMs - elapsedMs)
+
+# ------------------------------------------------------------------------------
+#
+# ------------------------------------------------------------------------------
+proc clearReconnectDelay(ctx: MqttCtx) =
+  ctx.reconnectDelayMs = 0
 
 # ------------------------------------------------------------------------------
 #
@@ -1029,7 +1073,9 @@ proc onConnAck(ctx: MqttCtx, pkt: Pkt): Future[void] {.async.} =
   let (code, _) = pkt.getu8(1)
 
   if code != ConnAcc.uint8:
-    ctx.info(&"[MQTT] onConnAck: connection failed, code: {code}")
+    ctx.registerReconnectFailure(
+      &"broker rejected CONNECT with CONNACK code {code}"
+    )
     ctx.cleanupDisconnectedTransport()
     return
 
@@ -1037,6 +1083,7 @@ proc onConnAck(ctx: MqttCtx, pkt: Pkt): Future[void] {.async.} =
   ctx.updatePublishState()
   ctx.beenConnected = true
   ctx.reconnectPolicy.reset()
+  ctx.clearReconnectDelay()
   ctx.info("[MQTT] onConnAck: connection established")
   await ctx.work()
 
@@ -1463,34 +1510,32 @@ proc runConnect(ctx: MqttCtx) {.async.} =
     if ctx.state == Disabled:
       break
 
-    var retryDelayMs = 1000
-
     if ctx.state in [Disconnected, Error]:
+      let remainingDelayMs = ctx.reconnectDelayRemainingMs()
+      if remainingDelayMs > 0:
+        await sleepAsync(remainingDelayMs)
+
+        if ctx.state == Disabled:
+          break
+        if ctx.state notin [Disconnected, Error]:
+          continue
+
+      ctx.clearReconnectDelay()
+
       try:
         await ctx.connectBroker()
       except CatchableError:
-        let
-          err = getCurrentExceptionMsg()
-          decision = ctx.reconnectPolicy.registerFailure(err)
-
-        retryDelayMs = decision.delaySec * 1000
-
-        if decision.shouldLog:
-          let suppressed =
-            if decision.suppressedFailures > 0:
-              &"; {decision.suppressedFailures} reconnect failures suppressed"
-            else:
-              ""
-          let errmsg = &"! [MQTT] runConnect: failed to connect, \"{err}\";" &
-              &" retry in {decision.delaySec}s{suppressed}."
-          ctx.error(errmsg)
+        ctx.registerReconnectFailure(getCurrentExceptionMsg())
 
       # pubCallbacks is the desired subscription registry. Restore every
       # registered subscription independently of pending publish work.
       if ctx.beenConnected:
         ctx.restoreSubscriptions()
 
-    await sleepAsync(retryDelayMs)
+    # Polling remains intentionally coarse. If runRx() reports an asynchronous
+    # CONNACK rejection during this sleep, the absolute retry deadline above
+    # accounts for the elapsed part of the requested backoff.
+    await sleepAsync(1000)
 
 # ==============================================================================
 # Public API
