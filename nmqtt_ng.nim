@@ -14,6 +14,9 @@ import std/[
   tables,
 ]
 
+when defined(ssl):
+  import std/openssl
+
 when defined(broker):
   import
     std/sequtils,
@@ -402,6 +405,45 @@ proc sendDisconnect(ctx: MqttCtx): Future[bool] {.async.}
 #
 # ------------------------------------------------------------------------------
 when defined(ssl):
+  proc sslGet0Param(ssl: SslPtr): pointer {.
+    cdecl,
+    dynlib: DLLSSLName,
+    importc: "SSL_get0_param",
+  .}
+
+  proc x509VerifyParamSet1Host(
+      param: pointer,
+      hostname: cstring,
+      hostnameLen: csize_t
+  ): cint {.
+    cdecl,
+    dynlib: DLLUtilName,
+    importc: "X509_VERIFY_PARAM_set1_host",
+  .}
+
+  proc x509VerifyParamSet1IpAsc(
+      param: pointer,
+      ipAddress: cstring
+  ): cint {.
+    cdecl,
+    dynlib: DLLUtilName,
+    importc: "X509_VERIFY_PARAM_set1_ip_asc",
+  .}
+
+  proc setSslExpectedPeer(ctx: MqttCtx) =
+    let param = sslGet0Param(ctx.s.sslHandle())
+    if param.isNil:
+      raiseSSLError("Failed to get TLS certificate verification parameters.")
+
+    let ok =
+      if isIpAddress(ctx.host):
+        x509VerifyParamSet1IpAsc(param, ctx.host.cstring)
+      else:
+        x509VerifyParamSet1Host(param, ctx.host.cstring, ctx.host.len.csize_t)
+
+    if ok != 1:
+      raiseSSLError("Failed to configure TLS peer hostname verification.")
+
   proc destroySslContext(ctx: MqttCtx) =
     if not ctx.ssl.isNil:
       ctx.ssl.destroyContext()
@@ -1331,6 +1373,7 @@ proc connectBroker(ctx: MqttCtx) {.async.} =
             handshakeAsClient,
             hostname = ctx.host,
           )
+          ctx.setSslExpectedPeer()
         else:
           wrapConnectedSocket(ctx.ssl, ctx.s, handshakeAsClient)
       else:
