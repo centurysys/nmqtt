@@ -14,6 +14,9 @@ import std/[
   tables,
 ]
 
+when defined(ssl):
+  import std/openssl
+
 when defined(broker):
   import
     std/sequtils,
@@ -36,6 +39,7 @@ type
     sslOn: bool
     sslCert: string
     sslKey: string
+    sslCaFile: string
     verbosity: int
     logging: bool
     beenConnected: bool
@@ -401,10 +405,64 @@ proc sendDisconnect(ctx: MqttCtx): Future[bool] {.async.}
 #
 # ------------------------------------------------------------------------------
 when defined(ssl):
+  proc sslGet0Param(ssl: SslPtr): pointer {.
+    cdecl,
+    dynlib: DLLSSLName,
+    importc: "SSL_get0_param",
+  .}
+
+  proc x509VerifyParamSet1Host(
+      param: pointer,
+      hostname: cstring,
+      hostnameLen: csize_t
+  ): cint {.
+    cdecl,
+    dynlib: DLLUtilName,
+    importc: "X509_VERIFY_PARAM_set1_host",
+  .}
+
+  proc x509VerifyParamSet1IpAsc(
+      param: pointer,
+      ipAddress: cstring
+  ): cint {.
+    cdecl,
+    dynlib: DLLUtilName,
+    importc: "X509_VERIFY_PARAM_set1_ip_asc",
+  .}
+
+  proc setSslExpectedPeer(ctx: MqttCtx) =
+    let param = sslGet0Param(ctx.s.sslHandle())
+    if param.isNil:
+      raiseSSLError("Failed to get TLS certificate verification parameters.")
+
+    let ok =
+      if isIpAddress(ctx.host):
+        x509VerifyParamSet1IpAsc(param, ctx.host.cstring)
+      else:
+        x509VerifyParamSet1Host(param, ctx.host.cstring, ctx.host.len.csize_t)
+
+    if ok != 1:
+      raiseSSLError("Failed to configure TLS peer hostname verification.")
+
   proc destroySslContext(ctx: MqttCtx) =
     if not ctx.ssl.isNil:
       ctx.ssl.destroyContext()
       ctx.ssl = nil
+
+# ------------------------------------------------------------------------------
+#
+# ------------------------------------------------------------------------------
+proc cleanupFailedConnection(ctx: MqttCtx) =
+  ## Release transport resources after TCP/TLS/MQTT connection setup fails.
+  ##
+  ## This path intentionally does not send MQTT DISCONNECT because the
+  ## connection may have failed before an MQTT session was established.
+  if not ctx.s.isNil:
+    ctx.s.close()
+    ctx.s = nil
+
+  when defined(ssl):
+    ctx.destroySslContext()
 
 # ------------------------------------------------------------------------------
 #
@@ -1287,21 +1345,53 @@ proc connectBroker(ctx: MqttCtx) {.async.} =
   ctx.info(&"[MQTT] Connecting to {ctx.host}:{ctx.port}...")
   ctx.state = Error # set to Connecting by sendConnect
   ctx.updatePublishState()
-  ctx.s = await asyncnet.dial(ctx.host, ctx.port)
-  if ctx.sslOn:
-    when defined(ssl):
-      ctx.destroySslContext()
-      ctx.ssl = newContext(protSSLv23, CVerifyNone, ctx.sslCert, ctx.sslKey)
-      wrapConnectedSocket(ctx.ssl, ctx.s, handshakeAsClient)
-    else:
-      ctx.wrn "Requested SSL session but ssl is not enabled"
-      await ctx.close("SSL not enabled")
-  let ok = await ctx.sendConnect()
-  if ok:
-    ctx.pingWorkerId.inc()
-    ctx.info(&"[MQTT] Connected, start async tasks, pingWorkerId: {ctx.pingWorkerId}")
-    asyncCheck ctx.runRx()
-    asyncCheck ctx.runPing(ctx.pingWorkerId)
+
+  try:
+    ctx.s = await asyncnet.dial(ctx.host, ctx.port)
+    if ctx.sslOn:
+      when defined(ssl):
+        ctx.destroySslContext()
+
+        let verifyMode =
+          if ctx.sslCaFile.len > 0:
+            CVerifyPeer
+          else:
+            CVerifyNone
+
+        ctx.ssl = newContext(
+          protVersion = protSSLv23,
+          verifyMode = verifyMode,
+          certFile = ctx.sslCert,
+          keyFile = ctx.sslKey,
+          caFile = ctx.sslCaFile,
+        )
+
+        if ctx.sslCaFile.len > 0:
+          wrapConnectedSocket(
+            ctx.ssl,
+            ctx.s,
+            handshakeAsClient,
+            hostname = ctx.host,
+          )
+          ctx.setSslExpectedPeer()
+        else:
+          wrapConnectedSocket(ctx.ssl, ctx.s, handshakeAsClient)
+      else:
+        ctx.wrn "Requested SSL session but ssl is not enabled"
+        await ctx.close("SSL not enabled")
+
+    let ok = await ctx.sendConnect()
+    if ok:
+      ctx.pingWorkerId.inc()
+      ctx.info(&"[MQTT] Connected, start async tasks, pingWorkerId: {ctx.pingWorkerId}")
+      asyncCheck ctx.runRx()
+      asyncCheck ctx.runPing(ctx.pingWorkerId)
+
+  except CatchableError:
+    ctx.cleanupFailedConnection()
+    ctx.state = Error
+    ctx.updatePublishState()
+    raise
 
 # ------------------------------------------------------------------------------
 #
@@ -1314,12 +1404,10 @@ proc runConnect(ctx: MqttCtx) {.async.} =
     elif ctx.state in [Disconnected, Error]:
       try:
         await ctx.connectBroker()
-      except OSError:
+      except CatchableError:
         let err = getCurrentExceptionMsg()
-        let errmsg = &"! [MQTT] runConnect: failed to connecting, \"{err}\"."
+        let errmsg = &"! [MQTT] runConnect: failed to connect, \"{err}\"."
         ctx.error(errmsg)
-        ctx.state = Error
-        ctx.updatePublishState()
       # If the client has been disconnect, it is necessary to tell the broker,
       # that we still want to be Subscribed. PubCallbacks still holds the
       # callbacks, but we need to re-Subscribe to the broker.
@@ -1397,6 +1485,16 @@ proc setSslCertificates*(ctx: MqttCtx, sslCert: string, sslKey: string) =
   # for mutal TLS authentication
   ctx.sslCert = sslCert
   ctx.sslKey = sslKey
+
+# ------------------------------------------------------------------------------
+#
+# ------------------------------------------------------------------------------
+proc setSslCaFile*(ctx: MqttCtx, sslCaFile: string) =
+  ## Set the CA certificate file for remote broker verification.
+  ##
+  ## Keeping this separate from setSslCertificates() preserves compatibility
+  ## with existing client-certificate users.
+  ctx.sslCaFile = sslCaFile
 
 # ------------------------------------------------------------------------------
 #

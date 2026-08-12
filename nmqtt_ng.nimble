@@ -1,5 +1,5 @@
 # Package
-version       = "1.0.0"
+version       = "1.1.0"
 author        = "zevv & ThomasTJdev, Takeyoshi Kikuchi"
 description   = "Native MQTT library and binaries for publishing, subscribing and broker"
 license       = "MIT"
@@ -10,5 +10,5 @@ installDirs   = @["nmqttngpkgs"]
 #skipDirs      = @["tests", "nmqtt"]
 
 # Dependencies
-requires "nim >= 2.2.8"
+requires "nim >= 2.2.10"
 requires "cligen >= 0.9.45"
