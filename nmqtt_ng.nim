@@ -540,14 +540,16 @@ proc cleanupDisconnectedTransport(ctx: MqttCtx) =
 # ------------------------------------------------------------------------------
 #
 # ------------------------------------------------------------------------------
-proc close(ctx: MqttCtx, reason: string) {.async.} =
+proc close(ctx: MqttCtx, reason: string, disable = false) {.async.} =
   if ctx.state in {Connecting, Connected}:
     ctx.state = Disconnecting
     if ctx.verbosity >= 1:
       ctx.dbg("Closing: " & reason)
     discard await ctx.sendDisconnect()
     ctx.s.close()
-    ctx.state = Disconnected
+    ctx.state = if disable: Disabled else: Disconnected
+  elif disable:
+    ctx.state = Disabled
   when defined(ssl):
     ctx.destroySslContext()
   ctx.updatePublishState()
@@ -1675,8 +1677,7 @@ proc start*(ctx: MqttCtx) {.async.} =
 # ------------------------------------------------------------------------------
 proc disconnect*(ctx: MqttCtx) {.async.} =
   ## Disconnect from the broker.
-  await ctx.close("disconnect")
-  ctx.state = Disabled
+  await ctx.close("disconnect", disable = true)
 
 # ------------------------------------------------------------------------------
 #
