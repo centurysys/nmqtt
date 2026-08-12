@@ -1418,6 +1418,33 @@ proc connectBroker(ctx: MqttCtx) {.async.} =
 # ------------------------------------------------------------------------------
 #
 # ------------------------------------------------------------------------------
+proc restoreSubscriptions(ctx: MqttCtx) =
+  ## Restore the desired subscriptions after a connection has been lost.
+  ##
+  ## A SUBSCRIBE that was sent before the disconnect may still be present in
+  ## the work queue as WorkSent. Reset such work so it is sent again on the new
+  ## connection. Subscriptions that were already acknowledged are no longer in
+  ## the work queue, so recreate them from pubCallbacks.
+  var queuedTopics = initTable[string, bool]()
+
+  for _, work in ctx.workQueue.pairs:
+    if work.wk == SubWork and work.typ == Subscribe and
+        ctx.pubCallbacks.hasKey(work.topic):
+      work.state = WorkNew
+      queuedTopics[work.topic] = true
+
+  for topic, cb in ctx.pubCallbacks:
+    if queuedTopics.hasKey(topic):
+      continue
+
+    let msgId = ctx.nextMsgId()
+    let work = newWork(wk = SubWork, msgId = msgId, topic = topic,
+        qos = cb.qos, typ = Subscribe)
+    discard ctx.workQueue.enqueue(work)
+
+# ------------------------------------------------------------------------------
+#
+# ------------------------------------------------------------------------------
 proc runConnect(ctx: MqttCtx) {.async.} =
   ## Auto-connect and reconnect to broker
   while true:
@@ -1430,20 +1457,11 @@ proc runConnect(ctx: MqttCtx) {.async.} =
         let err = getCurrentExceptionMsg()
         let errmsg = &"! [MQTT] runConnect: failed to connect, \"{err}\"."
         ctx.error(errmsg)
-      # If the client has been disconnect, it is necessary to tell the broker,
-      # that we still want to be Subscribed. PubCallbacks still holds the
-      # callbacks, but we need to re-Subscribe to the broker.
-      #
-      # If we Publish during the Disconnected, the msg will not be send, cause
-      # work() checks that `state=Connected`. Therefor our re-Subscribe
-      # will be inserted first in the queue.
+
+      # pubCallbacks is the desired subscription registry. Restore every
+      # registered subscription independently of pending publish work.
       if ctx.beenConnected:
-        if ctx.workQueue.len() == 0:
-          for topic, cb in ctx.pubCallbacks:
-            let msgId = ctx.nextMsgId()
-            let work = newWork(wk = SubWork, msgId = msgId, topic = topic,
-                qos = cb.qos, typ = Subscribe)
-            discard ctx.workQueue.enqueue(work)
+        ctx.restoreSubscriptions()
     await sleepAsync 1000
 
 # ==============================================================================
