@@ -27,10 +27,15 @@ when defined(broker):
   from parsecfg import loadConfig, getSectionValue
   from os import fileExists
 
+import ./nmqttngpkgs/reconnect_policy
 import ./nmqttngpkgs/syslog
 import ./nmqttngpkgs/work_queue
 
 export WorkCallback, PktType
+
+const
+  DefaultConnAckTimeoutMs = 10000
+  PingResponseGraceMs = 250
 
 type
   MqttCtx* = ref object
@@ -52,7 +57,13 @@ type
     msgIdSeq: MsgId
     workQueue: WorkQueue
     pingWorkerId: int
+    pingOutstanding: bool
+    connAckTimeoutMs: int
+    reconnectPolicy: ReconnectPolicy
+    reconnectDelayStartedAt: MonoTime
+    reconnectDelayMs: int
     pubCallbacks: Table[string, PubCallback]
+    pendingPubAcks: seq[MsgId]
     workCallback: Option[WorkCallback]
     stateCallback: Option[StateCallback]
     pState: PublishState
@@ -396,8 +407,12 @@ proc updatePublishState(ctx: MqttCtx) =
 #
 # ------------------------------------------------------------------------------
 proc nextMsgId(ctx: MqttCtx): MsgId =
-  ctx.msgIdSeq.inc
-  return ctx.msgIdSeq
+  let next = ctx.workQueue.nextAvailableMsgId(ctx.msgIdSeq)
+  if next.isNone:
+    raise newException(ValueError, "no MQTT packet identifiers available")
+
+  ctx.msgIdSeq = next.get()
+  result = ctx.msgIdSeq
 
 proc sendDisconnect(ctx: MqttCtx): Future[bool] {.async.}
 
@@ -452,6 +467,48 @@ when defined(ssl):
 # ------------------------------------------------------------------------------
 #
 # ------------------------------------------------------------------------------
+proc registerReconnectFailure(ctx: MqttCtx, errorMessage: string) =
+  ## Record a connection failure and schedule the next reconnect attempt.
+  ##
+  ## Connection setup failures are detected by runConnect(), while a rejected
+  ## CONNACK is detected asynchronously by runRx(). Keeping the retry deadline
+  ## in the context lets both paths share the same reconnect policy.
+  let decision = ctx.reconnectPolicy.registerFailure(errorMessage)
+
+  ctx.reconnectDelayStartedAt = getMonoTime()
+  ctx.reconnectDelayMs = decision.delaySec * 1000
+
+  if decision.shouldLog:
+    let suppressed =
+      if decision.suppressedFailures > 0:
+        &"; {decision.suppressedFailures} reconnect failures suppressed"
+      else:
+        ""
+    let errmsg = &"! [MQTT] reconnect failed, \"{errorMessage}\";" &
+        &" retry in {decision.delaySec}s{suppressed}."
+    ctx.error(errmsg)
+
+# ------------------------------------------------------------------------------
+#
+# ------------------------------------------------------------------------------
+proc reconnectDelayRemainingMs(ctx: MqttCtx): int =
+  ## Return the remaining reconnect delay, accounting for time already spent in
+  ## the runConnect polling loop after an asynchronous failure was reported.
+  if ctx.reconnectDelayMs <= 0:
+    return 0
+
+  let elapsedMs = (getMonoTime() - ctx.reconnectDelayStartedAt).inMilliseconds.int
+  result = max(0, ctx.reconnectDelayMs - elapsedMs)
+
+# ------------------------------------------------------------------------------
+#
+# ------------------------------------------------------------------------------
+proc clearReconnectDelay(ctx: MqttCtx) =
+  ctx.reconnectDelayMs = 0
+
+# ------------------------------------------------------------------------------
+#
+# ------------------------------------------------------------------------------
 proc cleanupFailedConnection(ctx: MqttCtx) =
   ## Release transport resources after TCP/TLS/MQTT connection setup fails.
   ##
@@ -461,20 +518,50 @@ proc cleanupFailedConnection(ctx: MqttCtx) =
     ctx.s.close()
     ctx.s = nil
 
+  ctx.pendingPubAcks.setLen(0)
+
   when defined(ssl):
     ctx.destroySslContext()
 
 # ------------------------------------------------------------------------------
 #
 # ------------------------------------------------------------------------------
-proc close(ctx: MqttCtx, reason: string) {.async.} =
+proc cleanupDisconnectedTransport(ctx: MqttCtx) =
+  ## Release transport resources after an established connection is lost.
+  ##
+  ## A remote disconnect must not use the graceful close path because the
+  ## transport is already unusable and sending MQTT DISCONNECT may itself
+  ## fail. Moving back to Disconnected lets runConnect() establish a fresh
+  ## transport.
+  if ctx.state in {Disabled, Disconnecting}:
+    return
+
+  if not ctx.s.isNil:
+    ctx.s.close()
+    ctx.s = nil
+
+  ctx.pendingPubAcks.setLen(0)
+
+  when defined(ssl):
+    ctx.destroySslContext()
+
+  ctx.state = Disconnected
+  ctx.updatePublishState()
+
+# ------------------------------------------------------------------------------
+#
+# ------------------------------------------------------------------------------
+proc close(ctx: MqttCtx, reason: string, disable = false) {.async.} =
   if ctx.state in {Connecting, Connected}:
     ctx.state = Disconnecting
     if ctx.verbosity >= 1:
       ctx.dbg("Closing: " & reason)
     discard await ctx.sendDisconnect()
     ctx.s.close()
-    ctx.state = Disconnected
+    ctx.state = if disable: Disabled else: Disconnected
+  elif disable:
+    ctx.state = Disabled
+  ctx.pendingPubAcks.setLen(0)
   when defined(ssl):
     ctx.destroySslContext()
   ctx.updatePublishState()
@@ -554,7 +641,6 @@ proc recv(ctx: MqttCtx): Future[Pkt] {.async.} =
   if r != 1:
     when not defined(broker):
       ctx.warning(&"! recv: recvInto() 0 byte received (1).")
-      await ctx.close("remote closed connection")
     return
 
   let typ = (b shr 4).PktType
@@ -569,7 +655,6 @@ proc recv(ctx: MqttCtx): Future[Pkt] {.async.} =
     if r != 1:
       when not defined(broker):
         ctx.warning(&"! recv: recvInto() 0 byte received (2).")
-        await ctx.close("remote closed connection")
       return
     len.inc((b and 127).int * mul)
     mul *= 128
@@ -579,8 +664,6 @@ proc recv(ctx: MqttCtx): Future[Pkt] {.async.} =
     pkt.data.setlen(len)
     r = await ctx.recvExact(pkt, len)
     if r != len:
-      when not defined(broker):
-        await ctx.close("remote closed connection")
       return
   ctx.dmp("rx> " & $pkt)
   return pkt
@@ -675,7 +758,7 @@ proc sendPublish(ctx: MqttCtx, msgId: MsgId, topic: string, message: string,
 # ------------------------------------------------------------------------------
 proc sendPubAck(ctx: MqttCtx, msgId: MsgId): Future[bool] =
   ctx.info(&"[MQTT] sendPubAck: msgId {msgId}")
-  var pkt = newPkt(PubAck, 0b0010)
+  var pkt = newPkt(PubAck, 0)
   pkt.put(msgId.uint16)
   result = ctx.send(pkt)
 
@@ -792,6 +875,12 @@ proc work(ctx: MqttCtx) {.async.} =
   ctx.inWork = true
   try:
     if ctx.state == Connected:
+      while ctx.pendingPubAcks.len > 0:
+        let msgId = ctx.pendingPubAcks[0]
+        if not await ctx.sendPubAck(msgId):
+          break
+        ctx.pendingPubAcks.delete(0)
+
       var delMsgIds: seq[MsgId]
       let allMsgIds = ctx.workQueue.msgIds()
       for msgId in allMsgIds:
@@ -835,7 +924,6 @@ proc work(ctx: MqttCtx) {.async.} =
           elif work.typ == Unsubscribe:
             if await ctx.sendWork(work):
               work.state = WorkSent
-              ctx.pubCallbacks.del work.topic
       for msgId in delMsgIds:
         discard ctx.workQueue.remove(msgId)
   finally:
@@ -1000,16 +1088,24 @@ proc onConnect(ctx: MqttCtx, pkt: Pkt) {.async.} =
 # ------------------------------------------------------------------------------
 #
 # ------------------------------------------------------------------------------
-proc onConnAck(ctx: MqttCtx, pkt: Pkt): Future[void] =
-  ctx.state = Connected
-  ctx.updatePublishState()
+proc onConnAck(ctx: MqttCtx, pkt: Pkt): Future[void] {.async.} =
   let (code, _) = pkt.getu8(1)
-  if code == 0:
-    ctx.beenConnected = true
-    ctx.info("[MQTT] onConnAck: connection established")
-  else:
-    ctx.info(&"[MQTT] onConnAck: connection failed, code: {code}")
-  result = ctx.work()
+
+  if code != ConnAcc.uint8:
+    ctx.registerReconnectFailure(
+      &"broker rejected CONNECT with CONNACK code {code}"
+    )
+    ctx.cleanupDisconnectedTransport()
+    return
+
+  ctx.state = Connected
+  ctx.pingOutstanding = false
+  ctx.updatePublishState()
+  ctx.beenConnected = true
+  ctx.reconnectPolicy.reset()
+  ctx.clearReconnectDelay()
+  ctx.info("[MQTT] onConnAck: connection established")
+  await ctx.work()
 
 # ------------------------------------------------------------------------------
 #
@@ -1088,9 +1184,11 @@ proc onPublish(ctx: MqttCtx, pkt: Pkt) {.async.} =
       cb.cb(topic, message)
 
   if qos == 1:
-    let work = newWork(wk = PubWork, msgId = msgId, state = WorkNew, qos = 1,
-        typ = PubAck)
-    discard ctx.workQueue.enqueue(work)
+    # Packet identifiers received from the broker are in a different namespace
+    # from identifiers allocated by this client. Keep PUBACK responses outside
+    # the outbound work queue so the same numeric ID can be active in both
+    # directions without collision. work() still serializes socket writes.
+    ctx.pendingPubAcks.add(msgId)
     await ctx.work()
   elif qos == 2:
     let work = newWork(wk = PubWork, msgId = msgId, state = WorkNew, qos = 2,
@@ -1104,7 +1202,13 @@ proc onPublish(ctx: MqttCtx, pkt: Pkt) {.async.} =
 proc onPubAck(ctx: MqttCtx, pkt: Pkt) {.async.} =
   let (msgId, _) = pkt.getu16(0)
   ctx.info(&"[MQTT] onPubAck: msgId: {msgId}")
-  if ctx.workQueue.contains(msgId):
+  let workOpt = ctx.workQueue.get(msgId)
+  if workOpt.isSome:
+    let work = workOpt.get()
+    if work.wk != PubWork or work.typ != Publish or work.qos != 1:
+      ctx.wrn(&"onPubAck: unexpected work for msgId {msgId}: {work.typ}")
+      return
+
     discard ctx.workQueue.remove(msgId)
     ctx.updatePublishState()
     if ctx.workCallback.isSome:
@@ -1116,9 +1220,22 @@ proc onPubAck(ctx: MqttCtx, pkt: Pkt) {.async.} =
 # ------------------------------------------------------------------------------
 proc onPubRec(ctx: MqttCtx, pkt: Pkt) {.async.} =
   let (msgId, _) = pkt.getu16(0)
-  let work = newWork(wk = PubWork, msgId = msgId, state = WorkNew, qos = 2,
-      typ = PubRel)
-  discard ctx.workQueue.enqueue(work)
+  let workOpt = ctx.workQueue.get(msgId)
+
+  if workOpt.isNone:
+    ctx.wrn(&"onPubRec: no pending QoS 2 publish for msgId {msgId}")
+    return
+
+  let work = workOpt.get()
+  if work.wk != PubWork or work.qos != 2 or work.typ notin [Publish, PubRel]:
+    ctx.wrn(&"onPubRec: unexpected work for msgId {msgId}: {work.typ}")
+    return
+
+  # PUBREC advances the outgoing QoS 2 transaction while retaining the same
+  # packet identifier. Reuse the existing queue entry instead of enqueueing a
+  # second work item with the same msgId.
+  work.typ = PubRel
+  work.state = WorkNew
   await ctx.work()
 
 # ------------------------------------------------------------------------------
@@ -1136,8 +1253,13 @@ proc onPubRel(ctx: MqttCtx, pkt: Pkt) {.async.} =
 # ------------------------------------------------------------------------------
 proc onPubComp(ctx: MqttCtx, pkt: Pkt) {.async.} =
   let (msgId, _) = pkt.getu16(0)
-  if ctx.workQueue.contains(msgId):
-    discard ctx.workQueue.remove(msgId)
+  let workOpt = ctx.workQueue.get(msgId)
+
+  if workOpt.isSome:
+    let work = workOpt.get()
+    if work.wk == PubWork and work.qos == 2 and work.typ == PubRel:
+      discard ctx.workQueue.remove(msgId)
+      ctx.updatePublishState()
 
 # ------------------------------------------------------------------------------
 #
@@ -1187,10 +1309,25 @@ proc onSubscribe(ctx: MqttCtx, pkt: Pkt) {.async.} =
 #
 # ------------------------------------------------------------------------------
 proc onSubAck(ctx: MqttCtx, pkt: Pkt) {.async.} =
-  let (msgId, _) = pkt.getu16(0)
-  ctx.info(&"[MQTT] onSubAck: msgId: {msgId}")
-  if ctx.workQueue.contains(msgId):
+  let
+    (msgId, offset) = pkt.getu16(0)
+    (returnCode, _) = pkt.getu8(offset)
+  ctx.info(&"[MQTT] onSubAck: msgId: {msgId}, returnCode: {returnCode}")
+
+  let workOpt = ctx.workQueue.get(msgId)
+  if workOpt.isSome:
+    let work = workOpt.get()
+    if work.wk != SubWork or work.typ != Subscribe:
+      ctx.wrn(&"onSubAck: unexpected work for msgId {msgId}: {work.typ}")
+      return
+
     discard ctx.workQueue.remove(msgId)
+    ctx.updatePublishState()
+
+  if returnCode == 0x80'u8:
+    ctx.error(&"! [MQTT] subscription rejected for msgId {msgId}")
+  elif returnCode > 2'u8:
+    ctx.wrn(&"onSubAck: invalid return code {returnCode} for msgId {msgId}")
 
 # ------------------------------------------------------------------------------
 #
@@ -1224,8 +1361,15 @@ proc onUnsubscribe(ctx: MqttCtx, pkt: Pkt) {.async.} =
 # ------------------------------------------------------------------------------
 proc onUnsubAck(ctx: MqttCtx, pkt: Pkt) {.async.} =
   let (msgId, _) = pkt.getu16(0)
-  if ctx.workQueue.contains(msgId):
+  let workOpt = ctx.workQueue.get(msgId)
+  if workOpt.isSome:
+    let work = workOpt.get()
+    if work.wk != SubWork or work.typ != Unsubscribe:
+      ctx.wrn(&"onUnsubAck: unexpected work for msgId {msgId}: {work.typ}")
+      return
+
     discard ctx.workQueue.remove(msgId)
+    ctx.updatePublishState()
 
 # ------------------------------------------------------------------------------
 #
@@ -1262,6 +1406,7 @@ proc onPingReq(ctx: MqttCtx, pkt: Pkt) {.async.} =
 # ------------------------------------------------------------------------------
 proc onPingResp(ctx: MqttCtx, pkt: Pkt) {.async.} =
   ctx.info("[MQTT] onPingResp")
+  ctx.pingOutstanding = false
 
 # ------------------------------------------------------------------------------
 #
@@ -1316,9 +1461,31 @@ proc runRx(ctx: MqttCtx) {.async.} =
         ctx.info("! [MQTT] runRx: socket disconnected.")
         break
       await ctx.handle(pkt)
-  except OsError:
+      if ctx.state notin [Connecting, Connected]:
+        break
+  except CatchableError:
     if ctx.verbosity >= 2:
-      ctx.wrn "Boom, socket is closed"
+      let err = getCurrentExceptionMsg()
+      ctx.wrn(&"runRx: receive failed, \"{err}\"")
+  finally:
+    ctx.cleanupDisconnectedTransport()
+
+# ------------------------------------------------------------------------------
+#
+# ------------------------------------------------------------------------------
+proc runConnAckTimeout(ctx: MqttCtx, workerId: int) {.async.} =
+  await sleepAsync(ctx.connAckTimeoutMs)
+
+  # A newer connection attempt, a successful CONNACK, or an explicit
+  # disconnect makes this watchdog stale. Only the matching connection that
+  # is still waiting in Connecting is allowed to trigger recovery.
+  if ctx.pingWorkerId != workerId or ctx.state != Connecting:
+    return
+
+  ctx.registerReconnectFailure(
+    &"CONNACK timeout after {ctx.connAckTimeoutMs} ms"
+  )
+  ctx.cleanupDisconnectedTransport()
 
 # ------------------------------------------------------------------------------
 #
@@ -1329,11 +1496,28 @@ proc runPing(ctx: MqttCtx, workerId: int) {.async.} =
     if ctx.pingWorkerId != workerId:
       ctx.warning("! [MQTT] runPing: re-connected, stop this worker.")
       break
+    if ctx.state == Connecting:
+      continue
+    if ctx.state != Connected:
+      break
+    if ctx.pingOutstanding:
+      # Give the receive task a small scheduling grace period before declaring
+      # the keepalive response lost. This avoids a false timeout when PINGRESP
+      # becomes readable at nearly the same instant as this worker wakes up.
+      await sleepAsync(PingResponseGraceMs)
+      if ctx.pingWorkerId != workerId or ctx.state != Connected:
+        break
+      if ctx.pingOutstanding:
+        ctx.warning("! [MQTT] runPing: PINGRESP timeout, reconnecting.")
+        ctx.cleanupDisconnectedTransport()
+        break
+      continue
     let ok = await ctx.sendPingReq()
     if not ok:
       ctx.warning("! [MQTT] runPing: sendPingReq failed.")
+      ctx.cleanupDisconnectedTransport()
       break
-    #await ctx.work()
+    ctx.pingOutstanding = true
 
 # ------------------------------------------------------------------------------
 #
@@ -1383,8 +1567,9 @@ proc connectBroker(ctx: MqttCtx) {.async.} =
     let ok = await ctx.sendConnect()
     if ok:
       ctx.pingWorkerId.inc()
-      ctx.info(&"[MQTT] Connected, start async tasks, pingWorkerId: {ctx.pingWorkerId}")
+      ctx.info(&"[MQTT] CONNECT sent, start async tasks, pingWorkerId: {ctx.pingWorkerId}")
       asyncCheck ctx.runRx()
+      asyncCheck ctx.runConnAckTimeout(ctx.pingWorkerId)
       asyncCheck ctx.runPing(ctx.pingWorkerId)
 
   except CatchableError:
@@ -1396,33 +1581,85 @@ proc connectBroker(ctx: MqttCtx) {.async.} =
 # ------------------------------------------------------------------------------
 #
 # ------------------------------------------------------------------------------
+proc restorePendingPublishes(ctx: MqttCtx) =
+  ## Make unacknowledged QoS publish work immediately eligible for resend after
+  ## a transport reconnect. The packet identifier is preserved. PUBLISH work
+  ## is resent with DUP set, while an outgoing QoS 2 transaction that already
+  ## reached PUBREL resumes from PUBREL instead of restarting with PUBLISH.
+  for _, work in ctx.workQueue.pairs:
+    if work.wk != PubWork or work.state != WorkSent:
+      continue
+
+    if work.typ == Publish and work.qos > 0:
+      work.state = WorkNew
+      work.dup = true
+    elif work.typ == PubRel and work.qos == 2:
+      work.state = WorkNew
+
+# ------------------------------------------------------------------------------
+#
+# ------------------------------------------------------------------------------
+proc restoreSubscriptions(ctx: MqttCtx) =
+  ## Restore the desired subscriptions after a connection has been lost.
+  ##
+  ## A SUBSCRIBE that was sent before the disconnect may still be present in
+  ## the work queue as WorkSent. Reset such work so it is sent again on the new
+  ## connection. Subscriptions that were already acknowledged are no longer in
+  ## the work queue, so recreate them from pubCallbacks.
+  var queuedTopics = initTable[string, bool]()
+
+  for _, work in ctx.workQueue.pairs:
+    if work.wk == SubWork and work.typ == Subscribe and
+        ctx.pubCallbacks.hasKey(work.topic):
+      work.state = WorkNew
+      queuedTopics[work.topic] = true
+
+  for topic, cb in ctx.pubCallbacks:
+    if queuedTopics.hasKey(topic):
+      continue
+
+    let msgId = ctx.nextMsgId()
+    let work = newWork(wk = SubWork, msgId = msgId, topic = topic,
+        qos = cb.qos, typ = Subscribe)
+    discard ctx.workQueue.enqueue(work)
+
+# ------------------------------------------------------------------------------
+#
+# ------------------------------------------------------------------------------
 proc runConnect(ctx: MqttCtx) {.async.} =
   ## Auto-connect and reconnect to broker
   while true:
     if ctx.state == Disabled:
       break
-    elif ctx.state in [Disconnected, Error]:
+
+    if ctx.state in [Disconnected, Error]:
+      let remainingDelayMs = ctx.reconnectDelayRemainingMs()
+      if remainingDelayMs > 0:
+        await sleepAsync(remainingDelayMs)
+
+        if ctx.state == Disabled:
+          break
+        if ctx.state notin [Disconnected, Error]:
+          continue
+
+      ctx.clearReconnectDelay()
+
       try:
         await ctx.connectBroker()
       except CatchableError:
-        let err = getCurrentExceptionMsg()
-        let errmsg = &"! [MQTT] runConnect: failed to connect, \"{err}\"."
-        ctx.error(errmsg)
-      # If the client has been disconnect, it is necessary to tell the broker,
-      # that we still want to be Subscribed. PubCallbacks still holds the
-      # callbacks, but we need to re-Subscribe to the broker.
-      #
-      # If we Publish during the Disconnected, the msg will not be send, cause
-      # work() checks that `state=Connected`. Therefor our re-Subscribe
-      # will be inserted first in the queue.
+        ctx.registerReconnectFailure(getCurrentExceptionMsg())
+
+      # Restore transport-dependent queued work after a reconnect. Pending QoS
+      # publishes must be eligible for immediate retransmission, while
+      # pubCallbacks remains the desired subscription registry.
       if ctx.beenConnected:
-        if ctx.workQueue.len() == 0:
-          for topic, cb in ctx.pubCallbacks:
-            let msgId = ctx.nextMsgId()
-            let work = newWork(wk = SubWork, msgId = msgId, topic = topic,
-                qos = cb.qos, typ = Subscribe)
-            discard ctx.workQueue.enqueue(work)
-    await sleepAsync 1000
+        ctx.restorePendingPublishes()
+        ctx.restoreSubscriptions()
+
+    # Polling remains intentionally coarse. If runRx() reports an asynchronous
+    # CONNACK rejection during this sleep, the absolute retry deadline above
+    # accounts for the elapsed part of the requested backoff.
+    await sleepAsync(1000)
 
 # ==============================================================================
 # Public API
@@ -1435,6 +1672,8 @@ proc newMqttCtx*(clientId: string, logging = false): MqttCtx =
   ## Initiate a new MQTT client
   result = MqttCtx(clientId: clientId, state: Disconnected)
   result.workQueue = newWorkQueue()
+  result.reconnectPolicy = newReconnectPolicy()
+  result.connAckTimeoutMs = DefaultConnAckTimeoutMs
   result.logging = logging
   # publish queue
   result.qWatermarks = Watermarks(h: 10, l: 2)
@@ -1467,6 +1706,14 @@ proc setPingInterval*(ctx: MqttCtx, txInterval: int = 60) =
   ## Set the clients ping interval in seconds. Default is 60 seconds.
   if txInterval > 0 and txInterval < 65535:
     ctx.keepAlive = txInterval.uint16
+
+# ------------------------------------------------------------------------------
+#
+# ------------------------------------------------------------------------------
+proc setConnAckTimeout*(ctx: MqttCtx, timeoutMs: int) =
+  ## Set the maximum time to wait for CONNACK after sending CONNECT.
+  if timeoutMs > 0:
+    ctx.connAckTimeoutMs = timeoutMs
 
 # ------------------------------------------------------------------------------
 #
@@ -1546,8 +1793,7 @@ proc start*(ctx: MqttCtx) {.async.} =
 # ------------------------------------------------------------------------------
 proc disconnect*(ctx: MqttCtx) {.async.} =
   ## Disconnect from the broker.
-  await ctx.close("disconnect")
-  ctx.state = Disabled
+  await ctx.close("disconnect", disable = true)
 
 # ------------------------------------------------------------------------------
 #
@@ -1608,16 +1854,24 @@ proc subscribe*(ctx: MqttCtx, topic: string, qos: int, callback: PubCallback.cb)
       typ = Subscribe)
   discard ctx.workQueue.enqueue(work)
   ctx.pubCallbacks[topic] = PubCallback(cb: callback, qos: qos)
+  ctx.updatePublishState()
   result = ctx.work()
 
 # ------------------------------------------------------------------------------
 #
 # ------------------------------------------------------------------------------
 proc unsubscribe*(ctx: MqttCtx, topic: string): Future[void] =
-  ## Unsubscribe to a topic.
+  ## Unsubscribe from a topic.
+  ##
+  ## pubCallbacks is the desired subscription registry used to restore
+  ## subscriptions after reconnect. Remove the topic before queueing the
+  ## UNSUBSCRIBE so a disconnect/reconnect cannot recreate a subscription
+  ## that the caller has already removed.
   let msgId = ctx.nextMsgId()
+  ctx.pubCallbacks.del(topic)
   let work = newWork(wk = SubWork, msgId = msgId, topic = topic, typ = Unsubscribe)
   discard ctx.workQueue.enqueue(work)
+  ctx.updatePublishState()
   result = ctx.work()
 
 # ------------------------------------------------------------------------------

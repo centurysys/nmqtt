@@ -1,8 +1,10 @@
-# Native Nim MQTT client library and binaries
+# nmqtt_ng - Native Nim MQTT client library and binaries
 
-This is a hybrid package including a native Nim MQTT library and
-binaries for a MQTT broker, publisher and subscriber.
+`nmqtt_ng` is a Century Systems fork of `nmqtt`. The package keeps the
+original MQTT broker, publisher and subscriber sources while extending the
+client library for long-running embedded and gateway applications.
 
+* [Version 1.1.1](#version-111)
 * [Install](#Install)
 * [Binaries](#Binaries)
   * [nmqtt](#nmqtt)
@@ -14,16 +16,46 @@ binaries for a MQTT broker, publisher and subscriber.
   * [Procs](#Procs)
 
 
+# Version 1.1.1
+
+Version 1.1.1 focuses on MQTT client reliability for long-running
+applications. The main changes are:
+
+- verified TLS when a CA file is configured, including DNS hostname and IP
+  address verification; TLS without a CA file keeps the legacy unverified
+  behavior for compatibility
+- automatic reconnect after transport loss, rejected CONNACK, and missing
+  CONNACK, with capped exponential backoff and repeated-error log suppression
+- PINGRESP timeout detection so half-open connections are discarded and
+  re-established
+- restoration of subscriptions after reconnect, independent of pending
+  publish work
+- immediate retransmission of unacknowledged QoS 1 publishes after reconnect,
+  preserving the packet identifier and setting the DUP flag
+- packet identifier allocation restricted to 1..65535 while avoiding IDs that
+  are still in use
+- corrected incoming QoS 1 acknowledgement handling so broker-originated
+  packet identifiers do not conflict with client-originated publish IDs
+- validation of SUBACK results and consistent publish-state updates as queued
+  work completes
+- consistent connection and publish-state notification after explicit
+  disconnect
+
+The reconnect and queue changes are primarily intended for the client-side
+`publish` / `subscribe` use case.
+
+
 # Install
 
-You can install this package with Nimble:
-```nim
-$ nimble install nmqtt
+You can install the fork directly with Nimble:
+```text
+$ nimble install https://github.com/centurysys/nmqtt
 ```
 
-or cloning and installing:
-```nim
-$ git clone https://github.com/zevv/nmqtt.git && cd nmqtt
+or clone and install it locally:
+```text
+$ git clone https://github.com/centurysys/nmqtt.git
+$ cd nmqtt
 $ nimble install
 ```
 
@@ -42,7 +74,7 @@ A default configuration file is provided in `config/nmqtt.conf`. You can copy an
 
 ```
 $ nmqtt --help
-nmqtt version 1.0.0
+nmqtt version 1.1.1
 
 nmqtt is a MQTT v3.1.1 broker
 
@@ -83,7 +115,7 @@ OPTIONS
 ```
 $ nmqtt_password --help
 nmqtt_password is a user and password manager for nmqtt
-nmqtt_password is based upon nmqtt version 1.0.0
+nmqtt_password is based upon nmqtt version 1.1.1
 
 USAGE
   nmqtt_password -a {password_file.conf} {username}
@@ -105,7 +137,7 @@ OPTIONS
 ```
 $ ./nmqtt_pub --help
 nmqtt_pub is a MQTT client for publishing messages to a MQTT-broker.
-nmqtt_pub is based upon nmqtt version 1.0.0
+nmqtt_pub is based upon nmqtt version 1.1.1
 
 Usage:
   nmqtt_pub [options] -t {topic} -m {message}
@@ -137,7 +169,7 @@ OPTIONS
 ```
 $ ./nmqtt_sub --help
 nmqtt_sub is a MQTT client that will subscribe to a topic on a MQTT-broker.
-nmqtt_sub is based upon nmqtt version 1.0.0
+nmqtt_sub is based upon nmqtt version 1.1.1
 
 Usage:
   nmqtt_sub [options] -t {topic}
@@ -166,7 +198,7 @@ OPTIONS
 # Library
 
 This library includes all the needed proc's for publishing MQTT messages to
-a MQTT-broker and for subscribing to a topic on a MQTT-broker. The library supports QOS 1, 2 and 3 for both publishing and subscribing and sending retained messages.
+a MQTT-broker and for subscribing to a topic on a MQTT-broker. The library supports MQTT QoS 0, 1 and 2 for publishing and subscribing, and supports retained messages.
 
 ## Examples
 
@@ -283,7 +315,22 @@ ____
 proc set_ping_interval*(ctx: MqttCtx, txInterval: int) =
 ```
 
-Set the clients ping interval in seconds. Default is 60 seconds.
+Set the client's keepalive ping interval in seconds. Default is 60 seconds.
+If a PINGRESP is not received before the next keepalive interval, the client
+closes the stalled transport and lets the automatic reconnect worker recover
+the connection.
+
+____
+
+### set_conn_ack_timeout*
+
+```nim
+proc set_conn_ack_timeout*(ctx: MqttCtx, timeoutMs: int) =
+```
+
+Set the maximum time to wait for CONNACK after sending CONNECT. The default is
+10 seconds. If the timeout expires, the connection is closed and retried using
+the normal reconnect backoff policy.
 
 ____
 
@@ -460,7 +507,7 @@ ____
 proc unsubscribe*(ctx: MqttCtx, topic: string): Future[void] =
 ```
 
-Unubscribe from a topic.
+Unsubscribe from a topic.
 
 
 ____
