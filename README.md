@@ -172,7 +172,7 @@ a MQTT-broker and for subscribing to a topic on a MQTT-broker. The library suppo
 
 ### Subscribe to topic
 ```nim
-import nmqtt, asyncdispatch
+import nmqtt_ng, asyncdispatch
 
 let ctx = newMqttCtx("nmqttClient")
 ctx.set_host("test.mosquitto.org", 1883)
@@ -190,6 +190,43 @@ proc mqttSub() {.async.} =
 asyncCheck mqttSub()
 runForever()
 ```
+
+### TLS and Mutual TLS with CA verification
+
+TLS is enabled by passing `true` as the third argument to `set_host`.
+Client certificates are configured separately from the CA certificate
+used to verify the remote broker.
+
+```nim
+import nmqtt_ng, asyncdispatch
+
+let ctx = newMqttCtx("nmqttTlsClient")
+
+ctx.set_host("broker.example.com", 8883, true)
+
+# Client certificate and private key for Mutual TLS authentication.
+ctx.set_ssl_certificates(
+  "/etc/nmqtt/client.crt",
+  "/etc/nmqtt/client.key",
+)
+
+# CA certificate used to verify the broker certificate.
+ctx.set_ssl_ca_file("/etc/nmqtt/root-ca.crt")
+
+proc mqttTls() {.async.} =
+  await ctx.start()
+  await ctx.publish("nmqtt", "hello", 1)
+
+asyncCheck mqttTls()
+runForever()
+```
+
+When a CA file is configured, nmqtt verifies both the broker certificate
+chain and the expected DNS hostname or IP address.
+
+For backwards compatibility, TLS without `set_ssl_ca_file` keeps the
+previous unverified TLS behavior. Applications that require authenticated
+TLS should always configure a CA file.
 
 ### Publish msg
 ```nim
@@ -256,7 +293,30 @@ ____
 proc set_ssl_certificates*(ctx: MqttCtx, sslCert: string, sslKey: string) =
 ```
 
-Sets the SSL Certificate and Key files to use Mutual TLS authentication
+Sets the client certificate and private key files used for Mutual TLS
+authentication.
+
+This configures the credentials presented by the MQTT client to the broker.
+Use `set_ssl_ca_file` separately to verify the broker certificate.
+
+
+____
+
+### set_ssl_ca_file*
+
+```nim
+proc set_ssl_ca_file*(ctx: MqttCtx, sslCaFile: string) =
+```
+
+Sets the CA certificate file used to verify the remote broker.
+
+When a CA file is configured, TLS peer verification is enabled and the
+broker certificate is checked against the configured DNS hostname or IP
+address.
+
+If no CA file is configured, TLS keeps the previous unverified behavior
+for backwards compatibility.
+
 
 ____
 
@@ -329,6 +389,23 @@ Disconnect from the broker.
 
 ____
 
+### publish_id*
+
+```nim
+proc publish_id*(ctx: MqttCtx, topic: string, message: string,
+                 qos=0, retain=false): Future[Option[MsgId]]
+```
+
+Queues a publish operation and returns its MQTT message ID when the work
+was accepted.
+
+The returned message ID can be matched with the callback registered by
+`register_callback`. For QoS 1, a `PubAck` callback is invoked with the
+same message ID after the broker acknowledges the publish.
+
+
+____
+
 ### publish*
 
 ```nim
@@ -395,6 +472,39 @@ proc isConnected*(ctx: MqttCtx): bool =
 ```
 
 Returns true, if the client is connected to the broker.
+
+
+____
+
+### register_callback*
+
+```nim
+proc register_callback*(
+  ctx: MqttCtx,
+  callback: proc(msgId: uint16, pktType: PktType)
+): bool
+```
+
+Registers a callback for completion of queued MQTT work.
+
+For a QoS 1 publish, the callback is invoked with `pktType == PubAck`.
+The `msgId` matches the ID returned by `publish_id`.
+
+Only one work callback can be registered. The proc returns `false` if a
+callback has already been registered.
+
+Use `unregister_callback` before registering a replacement callback.
+
+
+____
+
+### unregister_callback*
+
+```nim
+proc unregister_callback*(ctx: MqttCtx) =
+```
+
+Removes the registered work callback.
 
 
 ____
