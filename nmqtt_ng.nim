@@ -36,6 +36,7 @@ type
     sslOn: bool
     sslCert: string
     sslKey: string
+    sslCaFile: string
     verbosity: int
     logging: bool
     beenConnected: bool
@@ -1397,6 +1398,16 @@ proc setSslCertificates*(ctx: MqttCtx, sslCert: string, sslKey: string) =
   # for mutal TLS authentication
   ctx.sslCert = sslCert
   ctx.sslKey = sslKey
+
+# ------------------------------------------------------------------------------
+#
+# ------------------------------------------------------------------------------
+proc setSslCaFile*(ctx: MqttCtx, sslCaFile: string) =
+  ## Set the CA certificate file for remote broker verification.
+  ##
+  ## Keeping this separate from setSslCertificates() preserves compatibility
+  ## with existing client-certificate users.
+  ctx.sslCaFile = sslCaFile
 
 # ------------------------------------------------------------------------------
 #
