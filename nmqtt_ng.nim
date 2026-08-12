@@ -27,6 +27,7 @@ when defined(broker):
   from parsecfg import loadConfig, getSectionValue
   from os import fileExists
 
+import ./nmqttngpkgs/reconnect_policy
 import ./nmqttngpkgs/syslog
 import ./nmqttngpkgs/work_queue
 
@@ -52,6 +53,7 @@ type
     msgIdSeq: MsgId
     workQueue: WorkQueue
     pingWorkerId: int
+    reconnectPolicy: ReconnectPolicy
     pubCallbacks: Table[string, PubCallback]
     workCallback: Option[WorkCallback]
     stateCallback: Option[StateCallback]
@@ -1029,6 +1031,7 @@ proc onConnAck(ctx: MqttCtx, pkt: Pkt): Future[void] =
   let (code, _) = pkt.getu8(1)
   if code == 0:
     ctx.beenConnected = true
+    ctx.reconnectPolicy.reset()
     ctx.info("[MQTT] onConnAck: connection established")
   else:
     ctx.info(&"[MQTT] onConnAck: connection failed, code: {code}")
@@ -1454,19 +1457,35 @@ proc runConnect(ctx: MqttCtx) {.async.} =
   while true:
     if ctx.state == Disabled:
       break
-    elif ctx.state in [Disconnected, Error]:
+
+    var retryDelayMs = 1000
+
+    if ctx.state in [Disconnected, Error]:
       try:
         await ctx.connectBroker()
       except CatchableError:
-        let err = getCurrentExceptionMsg()
-        let errmsg = &"! [MQTT] runConnect: failed to connect, \"{err}\"."
-        ctx.error(errmsg)
+        let
+          err = getCurrentExceptionMsg()
+          decision = ctx.reconnectPolicy.registerFailure(err)
+
+        retryDelayMs = decision.delaySec * 1000
+
+        if decision.shouldLog:
+          let suppressed =
+            if decision.suppressedFailures > 0:
+              &"; {decision.suppressedFailures} reconnect failures suppressed"
+            else:
+              ""
+          let errmsg = &"! [MQTT] runConnect: failed to connect, \"{err}\";" &
+              &" retry in {decision.delaySec}s{suppressed}."
+          ctx.error(errmsg)
 
       # pubCallbacks is the desired subscription registry. Restore every
       # registered subscription independently of pending publish work.
       if ctx.beenConnected:
         ctx.restoreSubscriptions()
-    await sleepAsync 1000
+
+    await sleepAsync(retryDelayMs)
 
 # ==============================================================================
 # Public API
@@ -1479,6 +1498,7 @@ proc newMqttCtx*(clientId: string, logging = false): MqttCtx =
   ## Initiate a new MQTT client
   result = MqttCtx(clientId: clientId, state: Disconnected)
   result.workQueue = newWorkQueue()
+  result.reconnectPolicy = newReconnectPolicy()
   result.logging = logging
   # publish queue
   result.qWatermarks = Watermarks(h: 10, l: 2)
