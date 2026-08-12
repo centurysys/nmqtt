@@ -1345,6 +1345,8 @@ proc runRx(ctx: MqttCtx) {.async.} =
         ctx.info("! [MQTT] runRx: socket disconnected.")
         break
       await ctx.handle(pkt)
+      if ctx.state notin [Connecting, Connected]:
+        break
   except CatchableError:
     if ctx.verbosity >= 2:
       let err = getCurrentExceptionMsg()
