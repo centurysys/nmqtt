@@ -410,6 +410,21 @@ when defined(ssl):
 # ------------------------------------------------------------------------------
 #
 # ------------------------------------------------------------------------------
+proc cleanupFailedConnection(ctx: MqttCtx) =
+  ## Release transport resources after TCP/TLS/MQTT connection setup fails.
+  ##
+  ## This path intentionally does not send MQTT DISCONNECT because the
+  ## connection may have failed before an MQTT session was established.
+  if not ctx.s.isNil:
+    ctx.s.close()
+    ctx.s = nil
+
+  when defined(ssl):
+    ctx.destroySslContext()
+
+# ------------------------------------------------------------------------------
+#
+# ------------------------------------------------------------------------------
 proc close(ctx: MqttCtx, reason: string) {.async.} =
   if ctx.state in {Connecting, Connected}:
     ctx.state = Disconnecting
@@ -1337,10 +1352,11 @@ proc runConnect(ctx: MqttCtx) {.async.} =
     elif ctx.state in [Disconnected, Error]:
       try:
         await ctx.connectBroker()
-      except OSError:
+      except CatchableError:
         let err = getCurrentExceptionMsg()
-        let errmsg = &"! [MQTT] runConnect: failed to connecting, \"{err}\"."
+        let errmsg = &"! [MQTT] runConnect: failed to connect, \"{err}\"."
         ctx.error(errmsg)
+        ctx.cleanupFailedConnection()
         ctx.state = Error
         ctx.updatePublishState()
       # If the client has been disconnect, it is necessary to tell the broker,
