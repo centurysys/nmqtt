@@ -1303,43 +1303,52 @@ proc connectBroker(ctx: MqttCtx) {.async.} =
   ctx.info(&"[MQTT] Connecting to {ctx.host}:{ctx.port}...")
   ctx.state = Error # set to Connecting by sendConnect
   ctx.updatePublishState()
-  ctx.s = await asyncnet.dial(ctx.host, ctx.port)
-  if ctx.sslOn:
-    when defined(ssl):
-      ctx.destroySslContext()
 
-      let verifyMode =
-        if ctx.sslCaFile.len > 0:
-          CVerifyPeer
-        else:
-          CVerifyNone
+  try:
+    ctx.s = await asyncnet.dial(ctx.host, ctx.port)
+    if ctx.sslOn:
+      when defined(ssl):
+        ctx.destroySslContext()
 
-      ctx.ssl = newContext(
-        protVersion = protSSLv23,
-        verifyMode = verifyMode,
-        certFile = ctx.sslCert,
-        keyFile = ctx.sslKey,
-        caFile = ctx.sslCaFile,
-      )
+        let verifyMode =
+          if ctx.sslCaFile.len > 0:
+            CVerifyPeer
+          else:
+            CVerifyNone
 
-      if ctx.sslCaFile.len > 0:
-        wrapConnectedSocket(
-          ctx.ssl,
-          ctx.s,
-          handshakeAsClient,
-          hostname = ctx.host,
+        ctx.ssl = newContext(
+          protVersion = protSSLv23,
+          verifyMode = verifyMode,
+          certFile = ctx.sslCert,
+          keyFile = ctx.sslKey,
+          caFile = ctx.sslCaFile,
         )
+
+        if ctx.sslCaFile.len > 0:
+          wrapConnectedSocket(
+            ctx.ssl,
+            ctx.s,
+            handshakeAsClient,
+            hostname = ctx.host,
+          )
+        else:
+          wrapConnectedSocket(ctx.ssl, ctx.s, handshakeAsClient)
       else:
-        wrapConnectedSocket(ctx.ssl, ctx.s, handshakeAsClient)
-    else:
-      ctx.wrn "Requested SSL session but ssl is not enabled"
-      await ctx.close("SSL not enabled")
-  let ok = await ctx.sendConnect()
-  if ok:
-    ctx.pingWorkerId.inc()
-    ctx.info(&"[MQTT] Connected, start async tasks, pingWorkerId: {ctx.pingWorkerId}")
-    asyncCheck ctx.runRx()
-    asyncCheck ctx.runPing(ctx.pingWorkerId)
+        ctx.wrn "Requested SSL session but ssl is not enabled"
+        await ctx.close("SSL not enabled")
+
+    let ok = await ctx.sendConnect()
+    if ok:
+      ctx.pingWorkerId.inc()
+      ctx.info(&"[MQTT] Connected, start async tasks, pingWorkerId: {ctx.pingWorkerId}")
+      asyncCheck ctx.runRx()
+      asyncCheck ctx.runPing(ctx.pingWorkerId)
+
+  except CatchableError:
+    ctx.cleanupFailedConnection()
+    ctx.state = Error
+    ctx.updatePublishState()
+    raise
 
 # ------------------------------------------------------------------------------
 #
@@ -1356,9 +1365,6 @@ proc runConnect(ctx: MqttCtx) {.async.} =
         let err = getCurrentExceptionMsg()
         let errmsg = &"! [MQTT] runConnect: failed to connect, \"{err}\"."
         ctx.error(errmsg)
-        ctx.cleanupFailedConnection()
-        ctx.state = Error
-        ctx.updatePublishState()
       # If the client has been disconnect, it is necessary to tell the broker,
       # that we still want to be Subscribed. PubCallbacks still holds the
       # callbacks, but we need to re-Subscribe to the broker.
