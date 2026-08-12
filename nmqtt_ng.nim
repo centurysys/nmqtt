@@ -34,6 +34,7 @@ import ./nmqttngpkgs/work_queue
 export WorkCallback, PktType
 
 const
+  DefaultConnAckTimeoutMs = 10000
   PingResponseGraceMs = 250
 
 type
@@ -57,6 +58,7 @@ type
     workQueue: WorkQueue
     pingWorkerId: int
     pingOutstanding: bool
+    connAckTimeoutMs: int
     reconnectPolicy: ReconnectPolicy
     reconnectDelayStartedAt: MonoTime
     reconnectDelayMs: int
@@ -1471,6 +1473,23 @@ proc runRx(ctx: MqttCtx) {.async.} =
 # ------------------------------------------------------------------------------
 #
 # ------------------------------------------------------------------------------
+proc runConnAckTimeout(ctx: MqttCtx, workerId: int) {.async.} =
+  await sleepAsync(ctx.connAckTimeoutMs)
+
+  # A newer connection attempt, a successful CONNACK, or an explicit
+  # disconnect makes this watchdog stale. Only the matching connection that
+  # is still waiting in Connecting is allowed to trigger recovery.
+  if ctx.pingWorkerId != workerId or ctx.state != Connecting:
+    return
+
+  ctx.registerReconnectFailure(
+    &"CONNACK timeout after {ctx.connAckTimeoutMs} ms"
+  )
+  ctx.cleanupDisconnectedTransport()
+
+# ------------------------------------------------------------------------------
+#
+# ------------------------------------------------------------------------------
 proc runPing(ctx: MqttCtx, workerId: int) {.async.} =
   while true:
     await sleepAsync(ctx.keepAlive.int * 1000)
@@ -1548,8 +1567,9 @@ proc connectBroker(ctx: MqttCtx) {.async.} =
     let ok = await ctx.sendConnect()
     if ok:
       ctx.pingWorkerId.inc()
-      ctx.info(&"[MQTT] Connected, start async tasks, pingWorkerId: {ctx.pingWorkerId}")
+      ctx.info(&"[MQTT] CONNECT sent, start async tasks, pingWorkerId: {ctx.pingWorkerId}")
       asyncCheck ctx.runRx()
+      asyncCheck ctx.runConnAckTimeout(ctx.pingWorkerId)
       asyncCheck ctx.runPing(ctx.pingWorkerId)
 
   except CatchableError:
@@ -1653,6 +1673,7 @@ proc newMqttCtx*(clientId: string, logging = false): MqttCtx =
   result = MqttCtx(clientId: clientId, state: Disconnected)
   result.workQueue = newWorkQueue()
   result.reconnectPolicy = newReconnectPolicy()
+  result.connAckTimeoutMs = DefaultConnAckTimeoutMs
   result.logging = logging
   # publish queue
   result.qWatermarks = Watermarks(h: 10, l: 2)
@@ -1685,6 +1706,14 @@ proc setPingInterval*(ctx: MqttCtx, txInterval: int = 60) =
   ## Set the clients ping interval in seconds. Default is 60 seconds.
   if txInterval > 0 and txInterval < 65535:
     ctx.keepAlive = txInterval.uint16
+
+# ------------------------------------------------------------------------------
+#
+# ------------------------------------------------------------------------------
+proc setConnAckTimeout*(ctx: MqttCtx, timeoutMs: int) =
+  ## Set the maximum time to wait for CONNACK after sending CONNECT.
+  if timeoutMs > 0:
+    ctx.connAckTimeoutMs = timeoutMs
 
 # ------------------------------------------------------------------------------
 #
