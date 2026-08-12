@@ -1292,8 +1292,30 @@ proc connectBroker(ctx: MqttCtx) {.async.} =
   if ctx.sslOn:
     when defined(ssl):
       ctx.destroySslContext()
-      ctx.ssl = newContext(protSSLv23, CVerifyNone, ctx.sslCert, ctx.sslKey)
-      wrapConnectedSocket(ctx.ssl, ctx.s, handshakeAsClient)
+
+      let verifyMode =
+        if ctx.sslCaFile.len > 0:
+          CVerifyPeer
+        else:
+          CVerifyNone
+
+      ctx.ssl = newContext(
+        protVersion = protSSLv23,
+        verifyMode = verifyMode,
+        certFile = ctx.sslCert,
+        keyFile = ctx.sslKey,
+        caFile = ctx.sslCaFile,
+      )
+
+      if ctx.sslCaFile.len > 0:
+        wrapConnectedSocket(
+          ctx.ssl,
+          ctx.s,
+          handshakeAsClient,
+          hostname = ctx.host,
+        )
+      else:
+        wrapConnectedSocket(ctx.ssl, ctx.s, handshakeAsClient)
     else:
       ctx.wrn "Requested SSL session but ssl is not enabled"
       await ctx.close("SSL not enabled")
