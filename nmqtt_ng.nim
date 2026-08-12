@@ -33,6 +33,9 @@ import ./nmqttngpkgs/work_queue
 
 export WorkCallback, PktType
 
+const
+  PingResponseGraceMs = 250
+
 type
   MqttCtx* = ref object
     host: string
@@ -53,10 +56,12 @@ type
     msgIdSeq: MsgId
     workQueue: WorkQueue
     pingWorkerId: int
+    pingOutstanding: bool
     reconnectPolicy: ReconnectPolicy
     reconnectDelayStartedAt: MonoTime
     reconnectDelayMs: int
     pubCallbacks: Table[string, PubCallback]
+    pendingPubAcks: seq[MsgId]
     workCallback: Option[WorkCallback]
     stateCallback: Option[StateCallback]
     pState: PublishState
@@ -511,6 +516,8 @@ proc cleanupFailedConnection(ctx: MqttCtx) =
     ctx.s.close()
     ctx.s = nil
 
+  ctx.pendingPubAcks.setLen(0)
+
   when defined(ssl):
     ctx.destroySslContext()
 
@@ -531,6 +538,8 @@ proc cleanupDisconnectedTransport(ctx: MqttCtx) =
     ctx.s.close()
     ctx.s = nil
 
+  ctx.pendingPubAcks.setLen(0)
+
   when defined(ssl):
     ctx.destroySslContext()
 
@@ -550,6 +559,7 @@ proc close(ctx: MqttCtx, reason: string, disable = false) {.async.} =
     ctx.state = if disable: Disabled else: Disconnected
   elif disable:
     ctx.state = Disabled
+  ctx.pendingPubAcks.setLen(0)
   when defined(ssl):
     ctx.destroySslContext()
   ctx.updatePublishState()
@@ -746,7 +756,7 @@ proc sendPublish(ctx: MqttCtx, msgId: MsgId, topic: string, message: string,
 # ------------------------------------------------------------------------------
 proc sendPubAck(ctx: MqttCtx, msgId: MsgId): Future[bool] =
   ctx.info(&"[MQTT] sendPubAck: msgId {msgId}")
-  var pkt = newPkt(PubAck, 0b0010)
+  var pkt = newPkt(PubAck, 0)
   pkt.put(msgId.uint16)
   result = ctx.send(pkt)
 
@@ -863,6 +873,12 @@ proc work(ctx: MqttCtx) {.async.} =
   ctx.inWork = true
   try:
     if ctx.state == Connected:
+      while ctx.pendingPubAcks.len > 0:
+        let msgId = ctx.pendingPubAcks[0]
+        if not await ctx.sendPubAck(msgId):
+          break
+        ctx.pendingPubAcks.delete(0)
+
       var delMsgIds: seq[MsgId]
       let allMsgIds = ctx.workQueue.msgIds()
       for msgId in allMsgIds:
@@ -1081,6 +1097,7 @@ proc onConnAck(ctx: MqttCtx, pkt: Pkt): Future[void] {.async.} =
     return
 
   ctx.state = Connected
+  ctx.pingOutstanding = false
   ctx.updatePublishState()
   ctx.beenConnected = true
   ctx.reconnectPolicy.reset()
@@ -1165,9 +1182,11 @@ proc onPublish(ctx: MqttCtx, pkt: Pkt) {.async.} =
       cb.cb(topic, message)
 
   if qos == 1:
-    let work = newWork(wk = PubWork, msgId = msgId, state = WorkNew, qos = 1,
-        typ = PubAck)
-    discard ctx.workQueue.enqueue(work)
+    # Packet identifiers received from the broker are in a different namespace
+    # from identifiers allocated by this client. Keep PUBACK responses outside
+    # the outbound work queue so the same numeric ID can be active in both
+    # directions without collision. work() still serializes socket writes.
+    ctx.pendingPubAcks.add(msgId)
     await ctx.work()
   elif qos == 2:
     let work = newWork(wk = PubWork, msgId = msgId, state = WorkNew, qos = 2,
@@ -1181,7 +1200,13 @@ proc onPublish(ctx: MqttCtx, pkt: Pkt) {.async.} =
 proc onPubAck(ctx: MqttCtx, pkt: Pkt) {.async.} =
   let (msgId, _) = pkt.getu16(0)
   ctx.info(&"[MQTT] onPubAck: msgId: {msgId}")
-  if ctx.workQueue.contains(msgId):
+  let workOpt = ctx.workQueue.get(msgId)
+  if workOpt.isSome:
+    let work = workOpt.get()
+    if work.wk != PubWork or work.typ != Publish or work.qos != 1:
+      ctx.wrn(&"onPubAck: unexpected work for msgId {msgId}: {work.typ}")
+      return
+
     discard ctx.workQueue.remove(msgId)
     ctx.updatePublishState()
     if ctx.workCallback.isSome:
@@ -1282,10 +1307,25 @@ proc onSubscribe(ctx: MqttCtx, pkt: Pkt) {.async.} =
 #
 # ------------------------------------------------------------------------------
 proc onSubAck(ctx: MqttCtx, pkt: Pkt) {.async.} =
-  let (msgId, _) = pkt.getu16(0)
-  ctx.info(&"[MQTT] onSubAck: msgId: {msgId}")
-  if ctx.workQueue.contains(msgId):
+  let
+    (msgId, offset) = pkt.getu16(0)
+    (returnCode, _) = pkt.getu8(offset)
+  ctx.info(&"[MQTT] onSubAck: msgId: {msgId}, returnCode: {returnCode}")
+
+  let workOpt = ctx.workQueue.get(msgId)
+  if workOpt.isSome:
+    let work = workOpt.get()
+    if work.wk != SubWork or work.typ != Subscribe:
+      ctx.wrn(&"onSubAck: unexpected work for msgId {msgId}: {work.typ}")
+      return
+
     discard ctx.workQueue.remove(msgId)
+    ctx.updatePublishState()
+
+  if returnCode == 0x80'u8:
+    ctx.error(&"! [MQTT] subscription rejected for msgId {msgId}")
+  elif returnCode > 2'u8:
+    ctx.wrn(&"onSubAck: invalid return code {returnCode} for msgId {msgId}")
 
 # ------------------------------------------------------------------------------
 #
@@ -1319,8 +1359,15 @@ proc onUnsubscribe(ctx: MqttCtx, pkt: Pkt) {.async.} =
 # ------------------------------------------------------------------------------
 proc onUnsubAck(ctx: MqttCtx, pkt: Pkt) {.async.} =
   let (msgId, _) = pkt.getu16(0)
-  if ctx.workQueue.contains(msgId):
+  let workOpt = ctx.workQueue.get(msgId)
+  if workOpt.isSome:
+    let work = workOpt.get()
+    if work.wk != SubWork or work.typ != Unsubscribe:
+      ctx.wrn(&"onUnsubAck: unexpected work for msgId {msgId}: {work.typ}")
+      return
+
     discard ctx.workQueue.remove(msgId)
+    ctx.updatePublishState()
 
 # ------------------------------------------------------------------------------
 #
@@ -1357,6 +1404,7 @@ proc onPingReq(ctx: MqttCtx, pkt: Pkt) {.async.} =
 # ------------------------------------------------------------------------------
 proc onPingResp(ctx: MqttCtx, pkt: Pkt) {.async.} =
   ctx.info("[MQTT] onPingResp")
+  ctx.pingOutstanding = false
 
 # ------------------------------------------------------------------------------
 #
@@ -1429,11 +1477,28 @@ proc runPing(ctx: MqttCtx, workerId: int) {.async.} =
     if ctx.pingWorkerId != workerId:
       ctx.warning("! [MQTT] runPing: re-connected, stop this worker.")
       break
+    if ctx.state == Connecting:
+      continue
+    if ctx.state != Connected:
+      break
+    if ctx.pingOutstanding:
+      # Give the receive task a small scheduling grace period before declaring
+      # the keepalive response lost. This avoids a false timeout when PINGRESP
+      # becomes readable at nearly the same instant as this worker wakes up.
+      await sleepAsync(PingResponseGraceMs)
+      if ctx.pingWorkerId != workerId or ctx.state != Connected:
+        break
+      if ctx.pingOutstanding:
+        ctx.warning("! [MQTT] runPing: PINGRESP timeout, reconnecting.")
+        ctx.cleanupDisconnectedTransport()
+        break
+      continue
     let ok = await ctx.sendPingReq()
     if not ok:
       ctx.warning("! [MQTT] runPing: sendPingReq failed.")
+      ctx.cleanupDisconnectedTransport()
       break
-    #await ctx.work()
+    ctx.pingOutstanding = true
 
 # ------------------------------------------------------------------------------
 #
@@ -1760,6 +1825,7 @@ proc subscribe*(ctx: MqttCtx, topic: string, qos: int, callback: PubCallback.cb)
       typ = Subscribe)
   discard ctx.workQueue.enqueue(work)
   ctx.pubCallbacks[topic] = PubCallback(cb: callback, qos: qos)
+  ctx.updatePublishState()
   result = ctx.work()
 
 # ------------------------------------------------------------------------------
@@ -1776,6 +1842,7 @@ proc unsubscribe*(ctx: MqttCtx, topic: string): Future[void] =
   ctx.pubCallbacks.del(topic)
   let work = newWork(wk = SubWork, msgId = msgId, topic = topic, typ = Unsubscribe)
   discard ctx.workQueue.enqueue(work)
+  ctx.updatePublishState()
   result = ctx.work()
 
 # ------------------------------------------------------------------------------
