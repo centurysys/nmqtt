@@ -467,6 +467,29 @@ proc cleanupFailedConnection(ctx: MqttCtx) =
 # ------------------------------------------------------------------------------
 #
 # ------------------------------------------------------------------------------
+proc cleanupDisconnectedTransport(ctx: MqttCtx) =
+  ## Release transport resources after an established connection is lost.
+  ##
+  ## A remote disconnect must not use the graceful close path because the
+  ## transport is already unusable and sending MQTT DISCONNECT may itself
+  ## fail. Moving back to Disconnected lets runConnect() establish a fresh
+  ## transport.
+  if ctx.state in {Disabled, Disconnecting}:
+    return
+
+  if not ctx.s.isNil:
+    ctx.s.close()
+    ctx.s = nil
+
+  when defined(ssl):
+    ctx.destroySslContext()
+
+  ctx.state = Disconnected
+  ctx.updatePublishState()
+
+# ------------------------------------------------------------------------------
+#
+# ------------------------------------------------------------------------------
 proc close(ctx: MqttCtx, reason: string) {.async.} =
   if ctx.state in {Connecting, Connected}:
     ctx.state = Disconnecting
@@ -554,7 +577,6 @@ proc recv(ctx: MqttCtx): Future[Pkt] {.async.} =
   if r != 1:
     when not defined(broker):
       ctx.warning(&"! recv: recvInto() 0 byte received (1).")
-      await ctx.close("remote closed connection")
     return
 
   let typ = (b shr 4).PktType
@@ -569,7 +591,6 @@ proc recv(ctx: MqttCtx): Future[Pkt] {.async.} =
     if r != 1:
       when not defined(broker):
         ctx.warning(&"! recv: recvInto() 0 byte received (2).")
-        await ctx.close("remote closed connection")
       return
     len.inc((b and 127).int * mul)
     mul *= 128
@@ -579,8 +600,6 @@ proc recv(ctx: MqttCtx): Future[Pkt] {.async.} =
     pkt.data.setlen(len)
     r = await ctx.recvExact(pkt, len)
     if r != len:
-      when not defined(broker):
-        await ctx.close("remote closed connection")
       return
   ctx.dmp("rx> " & $pkt)
   return pkt
@@ -1316,9 +1335,12 @@ proc runRx(ctx: MqttCtx) {.async.} =
         ctx.info("! [MQTT] runRx: socket disconnected.")
         break
       await ctx.handle(pkt)
-  except OsError:
+  except CatchableError:
     if ctx.verbosity >= 2:
-      ctx.wrn "Boom, socket is closed"
+      let err = getCurrentExceptionMsg()
+      ctx.wrn(&"runRx: receive failed, \"{err}\"")
+  finally:
+    ctx.cleanupDisconnectedTransport()
 
 # ------------------------------------------------------------------------------
 #
