@@ -906,7 +906,6 @@ proc work(ctx: MqttCtx) {.async.} =
           elif work.typ == Unsubscribe:
             if await ctx.sendWork(work):
               work.state = WorkSent
-              ctx.pubCallbacks.del work.topic
       for msgId in delMsgIds:
         discard ctx.workQueue.remove(msgId)
   finally:
@@ -1744,8 +1743,14 @@ proc subscribe*(ctx: MqttCtx, topic: string, qos: int, callback: PubCallback.cb)
 #
 # ------------------------------------------------------------------------------
 proc unsubscribe*(ctx: MqttCtx, topic: string): Future[void] =
-  ## Unsubscribe to a topic.
+  ## Unsubscribe from a topic.
+  ##
+  ## pubCallbacks is the desired subscription registry used to restore
+  ## subscriptions after reconnect. Remove the topic before queueing the
+  ## UNSUBSCRIBE so a disconnect/reconnect cannot recreate a subscription
+  ## that the caller has already removed.
   let msgId = ctx.nextMsgId()
+  ctx.pubCallbacks.del(topic)
   let work = newWork(wk = SubWork, msgId = msgId, topic = topic, typ = Unsubscribe)
   discard ctx.workQueue.enqueue(work)
   result = ctx.work()
