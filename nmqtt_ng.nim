@@ -396,8 +396,12 @@ proc updatePublishState(ctx: MqttCtx) =
 #
 # ------------------------------------------------------------------------------
 proc nextMsgId(ctx: MqttCtx): MsgId =
-  ctx.msgIdSeq.inc
-  return ctx.msgIdSeq
+  let next = ctx.workQueue.nextAvailableMsgId(ctx.msgIdSeq)
+  if next.isNone:
+    raise newException(ValueError, "no MQTT packet identifiers available")
+
+  ctx.msgIdSeq = next.get()
+  result = ctx.msgIdSeq
 
 proc sendDisconnect(ctx: MqttCtx): Future[bool] {.async.}
 

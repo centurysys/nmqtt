@@ -136,6 +136,29 @@ proc contains*(self: WorkQueue, work: Work): bool =
 # ------------------------------------------------------------------------------
 # API:
 # ------------------------------------------------------------------------------
+proc nextAvailableMsgId*(self: WorkQueue, current: MsgId): Option[MsgId] =
+  ## Return the next MQTT packet identifier that is not currently in use.
+  ##
+  ## MQTT packet identifiers are in the range 1..65535. Identifier 0 is
+  ## reserved and must never be allocated. IDs that are still present in the
+  ## work queue are also skipped so an unacknowledged packet cannot collide
+  ## with a newly queued packet after sequence wrap-around.
+  var candidate = current
+
+  for _ in 0 ..< high(MsgId).int:
+    if candidate == high(MsgId):
+      candidate = MsgId(1)
+    else:
+      candidate.inc()
+
+    if not self.contains(candidate):
+      return some(candidate)
+
+  result = none(MsgId)
+
+# ------------------------------------------------------------------------------
+# API:
+# ------------------------------------------------------------------------------
 proc enqueue*(self: WorkQueue, work: Work): bool =
   if self.contains(work) or work.msgId == 0:
     return
