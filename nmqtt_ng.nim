@@ -1477,6 +1477,19 @@ proc connectBroker(ctx: MqttCtx) {.async.} =
 # ------------------------------------------------------------------------------
 #
 # ------------------------------------------------------------------------------
+proc restorePendingPublishes(ctx: MqttCtx) =
+  ## Make unacknowledged QoS publish work immediately eligible for resend after
+  ## a transport reconnect. The packet identifier is preserved and DUP is set
+  ## because this is a retransmission of the same MQTT PUBLISH packet.
+  for _, work in ctx.workQueue.pairs:
+    if work.wk == PubWork and work.typ == Publish and
+        work.qos > 0 and work.state == WorkSent:
+      work.state = WorkNew
+      work.dup = true
+
+# ------------------------------------------------------------------------------
+#
+# ------------------------------------------------------------------------------
 proc restoreSubscriptions(ctx: MqttCtx) =
   ## Restore the desired subscriptions after a connection has been lost.
   ##
@@ -1527,9 +1540,11 @@ proc runConnect(ctx: MqttCtx) {.async.} =
       except CatchableError:
         ctx.registerReconnectFailure(getCurrentExceptionMsg())
 
-      # pubCallbacks is the desired subscription registry. Restore every
-      # registered subscription independently of pending publish work.
+      # Restore transport-dependent queued work after a reconnect. Pending QoS
+      # publishes must be eligible for immediate retransmission, while
+      # pubCallbacks remains the desired subscription registry.
       if ctx.beenConnected:
+        ctx.restorePendingPublishes()
         ctx.restoreSubscriptions()
 
     # Polling remains intentionally coarse. If runRx() reports an asynchronous
