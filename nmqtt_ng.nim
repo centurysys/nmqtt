@@ -1193,9 +1193,22 @@ proc onPubAck(ctx: MqttCtx, pkt: Pkt) {.async.} =
 # ------------------------------------------------------------------------------
 proc onPubRec(ctx: MqttCtx, pkt: Pkt) {.async.} =
   let (msgId, _) = pkt.getu16(0)
-  let work = newWork(wk = PubWork, msgId = msgId, state = WorkNew, qos = 2,
-      typ = PubRel)
-  discard ctx.workQueue.enqueue(work)
+  let workOpt = ctx.workQueue.get(msgId)
+
+  if workOpt.isNone:
+    ctx.wrn(&"onPubRec: no pending QoS 2 publish for msgId {msgId}")
+    return
+
+  let work = workOpt.get()
+  if work.wk != PubWork or work.qos != 2 or work.typ notin [Publish, PubRel]:
+    ctx.wrn(&"onPubRec: unexpected work for msgId {msgId}: {work.typ}")
+    return
+
+  # PUBREC advances the outgoing QoS 2 transaction while retaining the same
+  # packet identifier. Reuse the existing queue entry instead of enqueueing a
+  # second work item with the same msgId.
+  work.typ = PubRel
+  work.state = WorkNew
   await ctx.work()
 
 # ------------------------------------------------------------------------------
@@ -1213,8 +1226,13 @@ proc onPubRel(ctx: MqttCtx, pkt: Pkt) {.async.} =
 # ------------------------------------------------------------------------------
 proc onPubComp(ctx: MqttCtx, pkt: Pkt) {.async.} =
   let (msgId, _) = pkt.getu16(0)
-  if ctx.workQueue.contains(msgId):
-    discard ctx.workQueue.remove(msgId)
+  let workOpt = ctx.workQueue.get(msgId)
+
+  if workOpt.isSome:
+    let work = workOpt.get()
+    if work.wk == PubWork and work.qos == 2 and work.typ == PubRel:
+      discard ctx.workQueue.remove(msgId)
+      ctx.updatePublishState()
 
 # ------------------------------------------------------------------------------
 #
@@ -1480,13 +1498,18 @@ proc connectBroker(ctx: MqttCtx) {.async.} =
 # ------------------------------------------------------------------------------
 proc restorePendingPublishes(ctx: MqttCtx) =
   ## Make unacknowledged QoS publish work immediately eligible for resend after
-  ## a transport reconnect. The packet identifier is preserved and DUP is set
-  ## because this is a retransmission of the same MQTT PUBLISH packet.
+  ## a transport reconnect. The packet identifier is preserved. PUBLISH work
+  ## is resent with DUP set, while an outgoing QoS 2 transaction that already
+  ## reached PUBREL resumes from PUBREL instead of restarting with PUBLISH.
   for _, work in ctx.workQueue.pairs:
-    if work.wk == PubWork and work.typ == Publish and
-        work.qos > 0 and work.state == WorkSent:
+    if work.wk != PubWork or work.state != WorkSent:
+      continue
+
+    if work.typ == Publish and work.qos > 0:
       work.state = WorkNew
       work.dup = true
+    elif work.typ == PubRel and work.qos == 2:
+      work.state = WorkNew
 
 # ------------------------------------------------------------------------------
 #
