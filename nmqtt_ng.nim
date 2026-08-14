@@ -1009,8 +1009,9 @@ when defined(broker):
       for c in mqttbroker.subscribers[ctx.willTopic]:
         let msgId = c.nextMsgId()
         let qos = qosAlign(ctx.willQos, c.subscribed[ctx.willTopic])
-        c.workQueue[msgId] = newWork(wk = PubWork, msgId = msgId,
+        let work = newWork(wk = PubWork, msgId = msgId,
             topic = ctx.willTopic, qos = qos, message = ctx.willMsg, typ = Publish)
+        discard c.workQueue.enqueue(work)
         await c.work()
 
 # ------------------------------------------------------------------------------
@@ -1028,12 +1029,14 @@ when defined(broker):
         msgId = c.nextMsgId()
         qosSub = qosAlign(qos, c.subscribed[topic])
       if mqttbroker.passClientId:
-        c.workQueue[msgId] = newWork(wk = PubWork, msgId = msgId, topic = topic,
+        let work = newWork(wk = PubWork, msgId = msgId, topic = topic,
             qos = qosSub, retain = retain, message = senderId & ":" & message,
             typ = Publish)
+        discard c.workQueue.enqueue(work)
       else:
-        c.workQueue[msgId] = newWork(wk = PubWork, msgId = msgId, topic = topic,
+        let work = newWork(wk = PubWork, msgId = msgId, topic = topic,
             qos = qosSub, retain = retain, message = message, typ = Publish)
+        discard c.workQueue.enqueue(work)
       await c.work()
 
 # ------------------------------------------------------------------------------
@@ -1092,20 +1095,9 @@ proc onConnect(ctx: MqttCtx, pkt: Pkt) {.async.} =
     # Check password and username
     if mqttbroker.passwords.len() > 0:
       let pass = mqttbroker.passwords.getOrDefault(ctx.username)
-      when defined(Windows):
-        ## TODO: Windows is using MD5 for storing the password, which is not
-        ##       safe in any way.
-        if pass == "" or
-            pass[0 .. 31] != makePassword(ctx.password,
-                pass[32 .. pass.len - 1], ""):
-          await denyConnect(ctx, ConnRefBadUserPwd)
-          return
-      else:
-        if pass == "" or
-            pass[0 .. 59] != makePassword(ctx.password,
-                pass[60 .. pass.len - 1], pass[0 .. 59]):
-          await denyConnect(ctx, ConnRefBadUserPwd)
-          return
+      if pass == "" or not verifyPassword(ctx.password, pass):
+        await denyConnect(ctx, ConnRefBadUserPwd)
+        return
     # 3.1.2.2 Protocol Level
     if ctx.proto != "MQTT":
       await denyConnect(ctx, ConnRefProtocol)
@@ -1148,9 +1140,7 @@ proc onConnect(ctx: MqttCtx, pkt: Pkt) {.async.} =
       verbose("Connections >> " & ctx.clientId & " has connected")
     if mqttbroker.verbosity >= 3:
       verbose(ctx)
-    ctx.workQueue[0.uint16] = newWork(wk = PubWork, flags = ConnAcc.uint16,
-        state = WorkNew, typ = ConnAck)
-    await ctx.work()
+    discard await ctx.sendConnAck(ConnAcc.uint16)
 
 # ------------------------------------------------------------------------------
 #
@@ -1350,23 +1340,26 @@ proc onSubscribe(ctx: MqttCtx, pkt: Pkt) {.async.} =
       (qos, offset)     = pkt.getu8(offset)
       ctx.subscribed[topic] = qos
       await addSubscriber(ctx, topic)
-    ctx.workQueue[msgId] = newWork(wk = PubWork, msgId = msgId, state = WorkNew,
+    let subAckWork = newWork(wk = PubWork, msgId = msgId, state = WorkNew,
         qos = 0, typ = SubAck)
+    discard ctx.workQueue.enqueue(subAckWork)
     # Send retained messaged for #
     if topic == "#":
       for top, ret in mqttbroker.retained:
         let
           msgId = ctx.nextMsgId()
           qosRet = qosAlign(qos, ret.qos)
-        ctx.workQueue[msgId] = newWork(wk = PubWork, msgId = msgId, topic = top,
+        let retainedWork = newWork(wk = PubWork, msgId = msgId, topic = top,
             qos = qosRet, message = ret.msg, typ = Publish)
+        discard ctx.workQueue.enqueue(retainedWork)
     # Send retained messaged for specific topic
     elif mqttbroker.retained.hasKey(topic):
       let
         msgId = ctx.nextMsgId()
         qosRet = qosAlign(qos, mqttbroker.retained[topic].qos)
-      ctx.workQueue[msgId] = newWork(wk = PubWork, msgId = msgId, topic = topic,
+      let retainedWork = newWork(wk = PubWork, msgId = msgId, topic = topic,
           qos = qosRet, message = mqttbroker.retained[topic].msg, typ = Publish)
+      discard ctx.workQueue.enqueue(retainedWork)
     if mqttbroker.verbosity >= 1:
       verbose("Client      >> " & ctx.clientId & " has subscribed to a topic")
       verbose("Subscribers", mqttbroker.subscribers)
@@ -1419,8 +1412,9 @@ proc onUnsubscribe(ctx: MqttCtx, pkt: Pkt) {.async.} =
     if mqttbroker.verbosity >= 1:
       verbose("Client      >> " & ctx.clientId & " has unsubscribed from a topic")
       verbose("Subscribers", mqttbroker.subscribers)
-    ctx.workQueue[msgId] = newWork(wk = PubWork, msgId = msgId, state = WorkNew,
+    let unsubAckWork = newWork(wk = PubWork, msgId = msgId, state = WorkNew,
         qos = 0, typ = UnsubAck)
+    discard ctx.workQueue.enqueue(unsubAckWork)
     await ctx.work()
 
 # ------------------------------------------------------------------------------
@@ -1461,7 +1455,7 @@ proc onPingReq(ctx: MqttCtx, pkt: Pkt) {.async.} =
     ctx.wrn "Packet type only supported for broker: " & $pkt.typ
   else:
     var msgId = ctx.nextMsgId() + 1000
-    while ctx.workQueue.hasKey(msgId):
+    while ctx.workQueue.contains(msgId):
       msgId += 1000
     let work = newWork(wk = PubWork, msgId = msgId, state = WorkNew, qos = 0,
         typ = PingResp)

@@ -4,6 +4,7 @@
 original MQTT broker, publisher and subscriber sources while extending the
 client library for long-running embedded and gateway applications.
 
+* [Version 1.1.2](#version-112)
 * [Version 1.1.1](#version-111)
 * [Install](#Install)
 * [Binaries](#Binaries)
@@ -14,6 +15,30 @@ client library for long-running embedded and gateway applications.
 * [Library](#Library)
   * [Examples](#Examples)
   * [Procs](#Procs)
+
+
+# Version 1.1.2
+
+Version 1.1.2 fixes MQTT connection lifecycle races around explicit
+disconnect and restart. The main changes are:
+
+- receive workers are bound to the transport they were started with so stale
+  receive cleanup cannot close or modify a newer connection
+- socket closure caused by an explicit disconnect is treated as normal receive
+  shutdown instead of being reported as a `Bad file descriptor` transport
+  error
+- lifecycle generations invalidate reconnect workers from earlier start/stop
+  sessions so they cannot resume after a restart
+- stale asynchronous connection attempts are rejected before they can replace
+  or clean up the current transport
+- CONNACK timeout and PING workers verify both their worker identity and
+  lifecycle generation before changing connection state
+- regression coverage for disconnect during reconnect backoff and CONNACK
+  wait, repeated stop/start cycles, and broker-side disconnect after lifecycle
+  restarts
+
+These changes keep the existing reconnect and publish behavior while making
+rapid explicit stop/start sequences safe.
 
 
 # Version 1.1.1
@@ -59,6 +84,14 @@ $ cd nmqtt
 $ nimble install
 ```
 
+To build the bundled command-line tools without installing them:
+```text
+$ nimble build
+```
+
+This builds the broker and client utilities declared by the package:
+`nmqtt`, `nmqtt_password`, `nmqtt_pub`, and `nmqtt_sub`.
+
 # Binaries
 
 The package provides 4 MQTT binaries:
@@ -74,7 +107,7 @@ A default configuration file is provided in `config/nmqtt.conf`. You can copy an
 
 ```
 $ nmqtt --help
-nmqtt version 1.1.1
+nmqtt version 1.1.2
 
 nmqtt is a MQTT v3.1.1 broker
 
@@ -115,7 +148,7 @@ OPTIONS
 ```
 $ nmqtt_password --help
 nmqtt_password is a user and password manager for nmqtt
-nmqtt_password is based upon nmqtt version 1.1.1
+nmqtt_password is based upon nmqtt version 1.1.2
 
 USAGE
   nmqtt_password -a {password_file.conf} {username}
@@ -137,7 +170,7 @@ OPTIONS
 ```
 $ ./nmqtt_pub --help
 nmqtt_pub is a MQTT client for publishing messages to a MQTT-broker.
-nmqtt_pub is based upon nmqtt version 1.1.1
+nmqtt_pub is based upon nmqtt version 1.1.2
 
 Usage:
   nmqtt_pub [options] -t {topic} -m {message}
@@ -169,7 +202,7 @@ OPTIONS
 ```
 $ ./nmqtt_sub --help
 nmqtt_sub is a MQTT client that will subscribe to a topic on a MQTT-broker.
-nmqtt_sub is based upon nmqtt version 1.1.1
+nmqtt_sub is based upon nmqtt version 1.1.2
 
 Usage:
   nmqtt_sub [options] -t {topic}
