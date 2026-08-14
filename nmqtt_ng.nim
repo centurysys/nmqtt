@@ -526,13 +526,26 @@ proc cleanupFailedConnection(ctx: MqttCtx) =
 # ------------------------------------------------------------------------------
 #
 # ------------------------------------------------------------------------------
-proc cleanupDisconnectedTransport(ctx: MqttCtx) =
+proc cleanupDisconnectedTransport(
+    ctx: MqttCtx,
+    transport: AsyncSocket = nil,
+) =
   ## Release transport resources after an established connection is lost.
+  ##
+  ## When a receive worker supplies its captured transport, only that transport
+  ## is allowed to affect the current MQTT connection. A receive worker can
+  ## finish after disconnect()/start() has already moved ctx.s to a newer
+  ## socket; in that case it must not close or reset the newer connection.
   ##
   ## A remote disconnect must not use the graceful close path because the
   ## transport is already unusable and sending MQTT DISCONNECT may itself
   ## fail. Moving back to Disconnected lets runConnect() establish a fresh
   ## transport.
+  if not transport.isNil and ctx.s != transport:
+    if not transport.isClosed():
+      transport.close()
+    return
+
   if ctx.state in {Disabled, Disconnecting}:
     return
 
@@ -596,7 +609,23 @@ proc send(ctx: MqttCtx, pkt: Pkt): Future[bool] {.async.} =
 # ------------------------------------------------------------------------------
 #
 # ------------------------------------------------------------------------------
-proc recvExact(ctx: MqttCtx, pkt: Pkt, len: int): Future[int] {.async.} =
+proc isActiveReceiveTransport(ctx: MqttCtx, transport: AsyncSocket): bool =
+  ## True only while this receive worker still owns the active transport.
+  ## Explicit disconnect and a later reconnect both make an older worker stale.
+  result =
+    not transport.isNil and
+    ctx.s == transport and
+    ctx.state in {Connecting, Connected}
+
+# ------------------------------------------------------------------------------
+#
+# ------------------------------------------------------------------------------
+proc recvExact(
+    ctx: MqttCtx,
+    transport: AsyncSocket,
+    pkt: Pkt,
+    len: int,
+): Future[int] {.async.} =
   if len == 0:
     return 0
   pkt.data.setLen(len)
@@ -605,11 +634,12 @@ proc recvExact(ctx: MqttCtx, pkt: Pkt, len: int): Future[int] {.async.} =
   while off < len:
     let r =
       try:
-        await ctx.s.recvInto(addr base[off], len - off)
+        await transport.recvInto(addr base[off], len - off)
       except CatchableError:
-        let err = getCurrentExceptionMsg()
-        let errmsg = &"! recvExact: caught exception, \"{err}\"."
-        ctx.error(errmsg)
+        if ctx.isActiveReceiveTransport(transport):
+          let err = getCurrentExceptionMsg()
+          let errmsg = &"! recvExact: caught exception, \"{err}\"."
+          ctx.error(errmsg)
         raise
     if r == 0:
       # clean EOF
@@ -620,10 +650,9 @@ proc recvExact(ctx: MqttCtx, pkt: Pkt, len: int): Future[int] {.async.} =
 # ------------------------------------------------------------------------------
 #
 # ------------------------------------------------------------------------------
-proc recv(ctx: MqttCtx): Future[Pkt] {.async.} =
-  ## Receive and parse the packet
-  if ctx.state notin [Connecting, Connected]:
-    ctx.wrn "recv: state notin Connecting/Connected"
+proc recv(ctx: MqttCtx, transport: AsyncSocket): Future[Pkt] {.async.} =
+  ## Receive and parse a packet from the transport captured by runRx().
+  if not ctx.isActiveReceiveTransport(transport):
     return
   var
     r: int
@@ -633,14 +662,16 @@ proc recv(ctx: MqttCtx): Future[Pkt] {.async.} =
   # we will encounter a silent crash in recvInto, when the client is
   # not actually using SSL.
   try:
-    r = await ctx.s.recvInto(b.addr, b.sizeof)
+    r = await transport.recvInto(b.addr, b.sizeof)
   except CatchableError:
-    let err = getCurrentExceptionMsg()
-    ctx.error(&"! recv: recvInto() caught exception, {err}")
+    if ctx.isActiveReceiveTransport(transport):
+      let err = getCurrentExceptionMsg()
+      ctx.error(&"! recv: recvInto() caught exception, {err}")
     return
   if r != 1:
     when not defined(broker):
-      ctx.warning(&"! recv: recvInto() 0 byte received (1).")
+      if ctx.isActiveReceiveTransport(transport):
+        ctx.warning(&"! recv: recvInto() 0 byte received (1).")
     return
 
   let typ = (b shr 4).PktType
@@ -651,10 +682,17 @@ proc recv(ctx: MqttCtx): Future[Pkt] {.async.} =
   var mul = 1
   for i in 0 .. 3:
     var b: uint8
-    r = await ctx.s.recvInto(b.addr, b.sizeof)
+    try:
+      r = await transport.recvInto(b.addr, b.sizeof)
+    except CatchableError:
+      if ctx.isActiveReceiveTransport(transport):
+        let err = getCurrentExceptionMsg()
+        ctx.error(&"! recv: remaining length recvInto() caught exception, {err}")
+      return
     if r != 1:
       when not defined(broker):
-        ctx.warning(&"! recv: recvInto() 0 byte received (2).")
+        if ctx.isActiveReceiveTransport(transport):
+          ctx.warning(&"! recv: recvInto() 0 byte received (2).")
       return
     len.inc((b and 127).int * mul)
     mul *= 128
@@ -662,7 +700,7 @@ proc recv(ctx: MqttCtx): Future[Pkt] {.async.} =
       break
   if len > 0:
     pkt.data.setlen(len)
-    r = await ctx.recvExact(pkt, len)
+    r = await ctx.recvExact(transport, pkt, len)
     if r != len:
       return
   ctx.dmp("rx> " & $pkt)
@@ -710,7 +748,7 @@ proc sendConnect(ctx: MqttCtx): Future[bool] =
 #
 # ------------------------------------------------------------------------------
 proc sendDisconnect(ctx: MqttCtx): Future[bool] =
-  ctx.info("[MQTT] sendDisonnect")
+  ctx.info("[MQTT] sendDisconnect")
   let pkt = newPkt(Disconnect, 0)
   result = ctx.send(pkt)
 
@@ -1453,22 +1491,23 @@ proc handle(ctx: MqttCtx, pkt: Pkt) {.async.} =
 # ------------------------------------------------------------------------------
 #
 # ------------------------------------------------------------------------------
-proc runRx(ctx: MqttCtx) {.async.} =
+proc runRx(ctx: MqttCtx, transport: AsyncSocket) {.async.} =
   try:
-    while true:
-      let pkt = await ctx.recv()
+    while ctx.isActiveReceiveTransport(transport):
+      let pkt = await ctx.recv(transport)
       if pkt.isNil or pkt.typ == Notype:
-        ctx.info("! [MQTT] runRx: socket disconnected.")
+        if ctx.isActiveReceiveTransport(transport):
+          ctx.info("! [MQTT] runRx: socket disconnected.")
+        break
+      if not ctx.isActiveReceiveTransport(transport):
         break
       await ctx.handle(pkt)
-      if ctx.state notin [Connecting, Connected]:
-        break
   except CatchableError:
-    if ctx.verbosity >= 2:
+    if ctx.isActiveReceiveTransport(transport) and ctx.verbosity >= 2:
       let err = getCurrentExceptionMsg()
       ctx.wrn(&"runRx: receive failed, \"{err}\"")
   finally:
-    ctx.cleanupDisconnectedTransport()
+    ctx.cleanupDisconnectedTransport(transport)
 
 # ------------------------------------------------------------------------------
 #
@@ -1568,7 +1607,8 @@ proc connectBroker(ctx: MqttCtx) {.async.} =
     if ok:
       ctx.pingWorkerId.inc()
       ctx.info(&"[MQTT] CONNECT sent, start async tasks, pingWorkerId: {ctx.pingWorkerId}")
-      asyncCheck ctx.runRx()
+      let rxTransport = ctx.s
+      asyncCheck ctx.runRx(rxTransport)
       asyncCheck ctx.runConnAckTimeout(ctx.pingWorkerId)
       asyncCheck ctx.runPing(ctx.pingWorkerId)
 

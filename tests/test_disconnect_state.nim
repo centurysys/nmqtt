@@ -15,6 +15,7 @@ type
     listener: AsyncSocket
     port: Port
     running: bool
+    acceptedConnections: int
 
 # ------------------------------------------------------------------------------
 #
@@ -93,6 +94,7 @@ proc runBroker(broker: TestBroker) {.async.} =
   while broker.running:
     try:
       let client = await broker.listener.accept()
+      broker.acceptedConnections.inc()
       asyncCheck handleClient(client)
 
     except CatchableError:
@@ -177,3 +179,34 @@ suite "Explicit disconnect state regression":
       check lastPublishState == psBlocked
 
     waitFor run()
+
+  test "keeps a restarted connection alive after explicit disconnect":
+    proc run() {.async.} =
+      let broker = newTestBroker()
+      defer:
+        broker.stop()
+
+      let ctx = newMqttCtx("nmqttDisconnectRestartRegression")
+      ctx.setHost("127.0.0.1", broker.port.int)
+
+      await ctx.start()
+      check await waitUntil(proc(): bool = ctx.isConnected())
+
+      for cycle in 1 .. 3:
+        await ctx.disconnect()
+        check not ctx.isConnected()
+
+        await ctx.start()
+        check await waitUntil(proc(): bool = ctx.isConnected())
+
+        # Give the receive worker from the previous transport time to finish.
+        # A stale worker must not clean up the newly connected socket.
+        await sleepAsync(100)
+        check ctx.isConnected()
+        check broker.acceptedConnections >= cycle + 1
+
+      await ctx.disconnect()
+      check not ctx.isConnected()
+
+    waitFor run()
+
