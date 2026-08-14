@@ -10,7 +10,7 @@
 # generated, the brokers binary will be named `nmqtt`.
 #
 
-include "../nmqtt.nim"
+include "../nmqtt_ng.nim"
 
 proc keepAliveMonitor(ctx: MqttCtx) {.async.} =
   ctx.lastAction = epochTime()
@@ -36,7 +36,7 @@ proc processClient(s: AsyncSocket) {.async.} =
 
   while ctx.state in [Connecting, Connected]:
     try:
-      var pkt = await ctx.recv()
+      var pkt = await ctx.recv(s)
       if pkt.typ == Notype:
         ctx.state = Error
         break

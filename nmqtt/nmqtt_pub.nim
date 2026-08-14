@@ -4,7 +4,7 @@ from os import getCurrentProcessId
 
 import utils/version
 
-include "../nmqtt.nim"
+include "../nmqtt_ng.nim"
 
 
 proc handler() {.noconv.} =

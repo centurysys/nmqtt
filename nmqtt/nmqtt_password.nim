@@ -12,9 +12,8 @@ import utils/version
 proc addUserToFile(filename, username, password: string) =
   ## Adds a new user
   let
-    salt    = makeSalt()
-    pwdHash = makePassword(password, salt)
-    storage = username & ":" & pwdHash & salt
+    pwdHash = hashPassword(password)
+    storage = username & ":" & pwdHash
 
   var buffer: string
   if fileExists(filename):
@@ -56,9 +55,6 @@ proc deleteUserToFile(filename, username: string) =
 proc nmqttPassword(adduser=false, batch=false, deluser=false, args: seq[string]) =
   ## Main handler
   echo "Running nmqtt_password v" & nmqttVersion
-
-  when defined(Windows):
-    echo "\nWARNING: On Windows passwords will only be hashed with MD5.\n"
 
   if args.len() == 0:
     echo "Error, missing parameters. Run again with --help."

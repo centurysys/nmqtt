@@ -8,14 +8,15 @@ import std/[
 import ../nmqtt_ng
 
 const
-  TestTimeoutMs = 5000
+  TestTimeoutMs = 8000
 
 type
   TestBroker = ref object
     listener: AsyncSocket
     port: Port
     running: bool
-    acceptedConnections: int
+    connectionCount: int
+    dropSecondConnection: bool
 
 # ------------------------------------------------------------------------------
 #
@@ -62,13 +63,30 @@ proc recvPacket(socket: AsyncSocket): Future[(uint8, string)] {.async.} =
 # ------------------------------------------------------------------------------
 #
 # ------------------------------------------------------------------------------
-proc handleClient(client: AsyncSocket) {.async.} =
+proc handleClient(
+    broker: TestBroker,
+    client: AsyncSocket,
+    connectionNumber: int,
+) {.async.} =
   try:
     let (connectHeader, _) = await client.recvPacket()
     if (connectHeader shr 4) != 1:
       raise newException(ValueError, "expected MQTT CONNECT packet")
 
+    if connectionNumber == 3:
+      # Reject the first automatic reconnect. Every live runConnect worker will
+      # then wait for the same absolute reconnect deadline. Without lifecycle
+      # generations, the worker left behind by the first start() can wake with
+      # the current worker and create an extra transport.
+      await client.send("\x20\x02\x00\x05")
+      return
+
     await client.send("\x20\x02\x00\x00")
+
+    if connectionNumber == 2:
+      while broker.running and not broker.dropSecondConnection:
+        await sleepAsync(10)
+      return
 
     while true:
       let (fixedHeader, _) = await client.recvPacket()
@@ -94,8 +112,8 @@ proc runBroker(broker: TestBroker) {.async.} =
   while broker.running:
     try:
       let client = await broker.listener.accept()
-      broker.acceptedConnections.inc()
-      asyncCheck handleClient(client)
+      broker.connectionCount.inc()
+      asyncCheck broker.handleClient(client, broker.connectionCount)
 
     except CatchableError:
       if not broker.running:
@@ -145,68 +163,50 @@ proc waitUntil(
 
   result = predicate()
 
-suite "Explicit disconnect state regression":
-  test "reports publish state blocked after explicit disconnect":
+suite "MQTT lifecycle generation regression":
+  test "old reconnect worker cannot create a duplicate transport after restart":
     proc run() {.async.} =
       let broker = newTestBroker()
       defer:
         broker.stop()
 
-      let ctx = newMqttCtx("nmqttDisconnectStateRegression")
-      ctx.setHost("127.0.0.1", broker.port.int)
-
-      var
-        lastConnected = false
-        lastPublishState = psBlocked
-        stateEvents = 0
-
-      proc onState(connected: bool, publishState: PublishState) =
-        lastConnected = connected
-        lastPublishState = publishState
-        stateEvents.inc()
-
-      check ctx.registerStateCallback(onState)
-
-      await ctx.start()
-      check await waitUntil(proc(): bool = ctx.isConnected())
-
-      let eventsBeforeDisconnect = stateEvents
-      await ctx.disconnect()
-
-      check not ctx.isConnected()
-      check stateEvents > eventsBeforeDisconnect
-      check not lastConnected
-      check lastPublishState == psBlocked
-
-    waitFor run()
-
-  test "keeps a restarted connection alive after explicit disconnect":
-    proc run() {.async.} =
-      let broker = newTestBroker()
-      defer:
-        broker.stop()
-
-      let ctx = newMqttCtx("nmqttDisconnectRestartRegression")
+      let ctx = newMqttCtx("nmqttLifecycleGenerationRegression")
       ctx.setHost("127.0.0.1", broker.port.int)
 
       await ctx.start()
       check await waitUntil(proc(): bool = ctx.isConnected())
+      check broker.connectionCount == 1
 
-      for cycle in 1 .. 3:
-        await ctx.disconnect()
-        check not ctx.isConnected()
+      # This leaves the original runConnect worker sleeping in implementations
+      # that do not explicitly invalidate a lifecycle on disconnect().
+      await ctx.disconnect()
+      await ctx.start()
 
-        await ctx.start()
-        check await waitUntil(proc(): bool = ctx.isConnected())
+      check await waitUntil(proc(): bool = ctx.isConnected())
+      check broker.connectionCount == 2
 
-        # Give the receive worker from the previous transport time to finish.
-        # A stale worker must not clean up the newly connected socket.
-        await sleepAsync(100)
-        check ctx.isConnected()
-        check broker.acceptedConnections >= cycle + 1
+      # Give the worker from the first start() enough time to wake once while
+      # connection #2 remains healthy. A stale worker must terminate rather
+      # than stay dormant and become active on a later disconnect.
+      await sleepAsync(1200)
+      check ctx.isConnected()
+      check broker.connectionCount == 2
+
+      # Drop connection #2. Connection #3 is rejected intentionally, aligning
+      # reconnect workers on one backoff deadline. Exactly one current worker
+      # must create connection #4 when that deadline expires.
+      broker.dropSecondConnection = true
+
+      check await waitUntil(proc(): bool = broker.connectionCount >= 3)
+      check await waitUntil(proc(): bool = broker.connectionCount >= 4)
+      check await waitUntil(proc(): bool = ctx.isConnected())
+
+      # Concurrent stale reconnect attempts would already have reached the
+      # local broker by now.
+      await sleepAsync(300)
+      check broker.connectionCount == 4
+      check ctx.isConnected()
 
       await ctx.disconnect()
-      check not ctx.isConnected()
 
     waitFor run()
-

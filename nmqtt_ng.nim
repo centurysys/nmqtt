@@ -57,6 +57,7 @@ type
     msgIdSeq: MsgId
     workQueue: WorkQueue
     pingWorkerId: int
+    lifecycleGeneration: int
     pingOutstanding: bool
     connAckTimeoutMs: int
     reconnectPolicy: ReconnectPolicy
@@ -467,6 +468,21 @@ when defined(ssl):
 # ------------------------------------------------------------------------------
 #
 # ------------------------------------------------------------------------------
+proc nextLifecycleGeneration(ctx: MqttCtx): int =
+  ## Start a new connection lifecycle and invalidate async workers created by
+  ## every previous start/connect cycle.
+  ctx.lifecycleGeneration.inc()
+  result = ctx.lifecycleGeneration
+
+# ------------------------------------------------------------------------------
+#
+# ------------------------------------------------------------------------------
+proc isCurrentLifecycle(ctx: MqttCtx, generation: int): bool =
+  result = ctx.lifecycleGeneration == generation
+
+# ------------------------------------------------------------------------------
+#
+# ------------------------------------------------------------------------------
 proc registerReconnectFailure(ctx: MqttCtx, errorMessage: string) =
   ## Record a connection failure and schedule the next reconnect attempt.
   ##
@@ -509,11 +525,24 @@ proc clearReconnectDelay(ctx: MqttCtx) =
 # ------------------------------------------------------------------------------
 #
 # ------------------------------------------------------------------------------
-proc cleanupFailedConnection(ctx: MqttCtx) =
+proc cleanupFailedConnection(
+    ctx: MqttCtx,
+    transport: AsyncSocket = nil,
+) =
   ## Release transport resources after TCP/TLS/MQTT connection setup fails.
+  ##
+  ## A stale connection attempt may finish after a newer lifecycle has already
+  ## installed another socket in ctx.s. In that case only the transport owned
+  ## by the failed attempt may be closed; the newer transport and its TLS
+  ## context must remain untouched.
   ##
   ## This path intentionally does not send MQTT DISCONNECT because the
   ## connection may have failed before an MQTT session was established.
+  if not transport.isNil and ctx.s != transport:
+    if not transport.isClosed():
+      transport.close()
+    return
+
   if not ctx.s.isNil:
     ctx.s.close()
     ctx.s = nil
@@ -526,13 +555,26 @@ proc cleanupFailedConnection(ctx: MqttCtx) =
 # ------------------------------------------------------------------------------
 #
 # ------------------------------------------------------------------------------
-proc cleanupDisconnectedTransport(ctx: MqttCtx) =
+proc cleanupDisconnectedTransport(
+    ctx: MqttCtx,
+    transport: AsyncSocket = nil,
+) =
   ## Release transport resources after an established connection is lost.
+  ##
+  ## When a receive worker supplies its captured transport, only that transport
+  ## is allowed to affect the current MQTT connection. A receive worker can
+  ## finish after disconnect()/start() has already moved ctx.s to a newer
+  ## socket; in that case it must not close or reset the newer connection.
   ##
   ## A remote disconnect must not use the graceful close path because the
   ## transport is already unusable and sending MQTT DISCONNECT may itself
   ## fail. Moving back to Disconnected lets runConnect() establish a fresh
   ## transport.
+  if not transport.isNil and ctx.s != transport:
+    if not transport.isClosed():
+      transport.close()
+    return
+
   if ctx.state in {Disabled, Disconnecting}:
     return
 
@@ -596,7 +638,23 @@ proc send(ctx: MqttCtx, pkt: Pkt): Future[bool] {.async.} =
 # ------------------------------------------------------------------------------
 #
 # ------------------------------------------------------------------------------
-proc recvExact(ctx: MqttCtx, pkt: Pkt, len: int): Future[int] {.async.} =
+proc isActiveReceiveTransport(ctx: MqttCtx, transport: AsyncSocket): bool =
+  ## True only while this receive worker still owns the active transport.
+  ## Explicit disconnect and a later reconnect both make an older worker stale.
+  result =
+    not transport.isNil and
+    ctx.s == transport and
+    ctx.state in {Connecting, Connected}
+
+# ------------------------------------------------------------------------------
+#
+# ------------------------------------------------------------------------------
+proc recvExact(
+    ctx: MqttCtx,
+    transport: AsyncSocket,
+    pkt: Pkt,
+    len: int,
+): Future[int] {.async.} =
   if len == 0:
     return 0
   pkt.data.setLen(len)
@@ -605,11 +663,12 @@ proc recvExact(ctx: MqttCtx, pkt: Pkt, len: int): Future[int] {.async.} =
   while off < len:
     let r =
       try:
-        await ctx.s.recvInto(addr base[off], len - off)
+        await transport.recvInto(addr base[off], len - off)
       except CatchableError:
-        let err = getCurrentExceptionMsg()
-        let errmsg = &"! recvExact: caught exception, \"{err}\"."
-        ctx.error(errmsg)
+        if ctx.isActiveReceiveTransport(transport):
+          let err = getCurrentExceptionMsg()
+          let errmsg = &"! recvExact: caught exception, \"{err}\"."
+          ctx.error(errmsg)
         raise
     if r == 0:
       # clean EOF
@@ -620,10 +679,9 @@ proc recvExact(ctx: MqttCtx, pkt: Pkt, len: int): Future[int] {.async.} =
 # ------------------------------------------------------------------------------
 #
 # ------------------------------------------------------------------------------
-proc recv(ctx: MqttCtx): Future[Pkt] {.async.} =
-  ## Receive and parse the packet
-  if ctx.state notin [Connecting, Connected]:
-    ctx.wrn "recv: state notin Connecting/Connected"
+proc recv(ctx: MqttCtx, transport: AsyncSocket): Future[Pkt] {.async.} =
+  ## Receive and parse a packet from the transport captured by runRx().
+  if not ctx.isActiveReceiveTransport(transport):
     return
   var
     r: int
@@ -633,14 +691,16 @@ proc recv(ctx: MqttCtx): Future[Pkt] {.async.} =
   # we will encounter a silent crash in recvInto, when the client is
   # not actually using SSL.
   try:
-    r = await ctx.s.recvInto(b.addr, b.sizeof)
+    r = await transport.recvInto(b.addr, b.sizeof)
   except CatchableError:
-    let err = getCurrentExceptionMsg()
-    ctx.error(&"! recv: recvInto() caught exception, {err}")
+    if ctx.isActiveReceiveTransport(transport):
+      let err = getCurrentExceptionMsg()
+      ctx.error(&"! recv: recvInto() caught exception, {err}")
     return
   if r != 1:
     when not defined(broker):
-      ctx.warning(&"! recv: recvInto() 0 byte received (1).")
+      if ctx.isActiveReceiveTransport(transport):
+        ctx.warning(&"! recv: recvInto() 0 byte received (1).")
     return
 
   let typ = (b shr 4).PktType
@@ -651,10 +711,17 @@ proc recv(ctx: MqttCtx): Future[Pkt] {.async.} =
   var mul = 1
   for i in 0 .. 3:
     var b: uint8
-    r = await ctx.s.recvInto(b.addr, b.sizeof)
+    try:
+      r = await transport.recvInto(b.addr, b.sizeof)
+    except CatchableError:
+      if ctx.isActiveReceiveTransport(transport):
+        let err = getCurrentExceptionMsg()
+        ctx.error(&"! recv: remaining length recvInto() caught exception, {err}")
+      return
     if r != 1:
       when not defined(broker):
-        ctx.warning(&"! recv: recvInto() 0 byte received (2).")
+        if ctx.isActiveReceiveTransport(transport):
+          ctx.warning(&"! recv: recvInto() 0 byte received (2).")
       return
     len.inc((b and 127).int * mul)
     mul *= 128
@@ -662,7 +729,7 @@ proc recv(ctx: MqttCtx): Future[Pkt] {.async.} =
       break
   if len > 0:
     pkt.data.setlen(len)
-    r = await ctx.recvExact(pkt, len)
+    r = await ctx.recvExact(transport, pkt, len)
     if r != len:
       return
   ctx.dmp("rx> " & $pkt)
@@ -710,7 +777,7 @@ proc sendConnect(ctx: MqttCtx): Future[bool] =
 #
 # ------------------------------------------------------------------------------
 proc sendDisconnect(ctx: MqttCtx): Future[bool] =
-  ctx.info("[MQTT] sendDisonnect")
+  ctx.info("[MQTT] sendDisconnect")
   let pkt = newPkt(Disconnect, 0)
   result = ctx.send(pkt)
 
@@ -942,8 +1009,9 @@ when defined(broker):
       for c in mqttbroker.subscribers[ctx.willTopic]:
         let msgId = c.nextMsgId()
         let qos = qosAlign(ctx.willQos, c.subscribed[ctx.willTopic])
-        c.workQueue[msgId] = newWork(wk = PubWork, msgId = msgId,
+        let work = newWork(wk = PubWork, msgId = msgId,
             topic = ctx.willTopic, qos = qos, message = ctx.willMsg, typ = Publish)
+        discard c.workQueue.enqueue(work)
         await c.work()
 
 # ------------------------------------------------------------------------------
@@ -961,12 +1029,14 @@ when defined(broker):
         msgId = c.nextMsgId()
         qosSub = qosAlign(qos, c.subscribed[topic])
       if mqttbroker.passClientId:
-        c.workQueue[msgId] = newWork(wk = PubWork, msgId = msgId, topic = topic,
+        let work = newWork(wk = PubWork, msgId = msgId, topic = topic,
             qos = qosSub, retain = retain, message = senderId & ":" & message,
             typ = Publish)
+        discard c.workQueue.enqueue(work)
       else:
-        c.workQueue[msgId] = newWork(wk = PubWork, msgId = msgId, topic = topic,
+        let work = newWork(wk = PubWork, msgId = msgId, topic = topic,
             qos = qosSub, retain = retain, message = message, typ = Publish)
+        discard c.workQueue.enqueue(work)
       await c.work()
 
 # ------------------------------------------------------------------------------
@@ -1025,20 +1095,9 @@ proc onConnect(ctx: MqttCtx, pkt: Pkt) {.async.} =
     # Check password and username
     if mqttbroker.passwords.len() > 0:
       let pass = mqttbroker.passwords.getOrDefault(ctx.username)
-      when defined(Windows):
-        ## TODO: Windows is using MD5 for storing the password, which is not
-        ##       safe in any way.
-        if pass == "" or
-            pass[0 .. 31] != makePassword(ctx.password,
-                pass[32 .. pass.len - 1], ""):
-          await denyConnect(ctx, ConnRefBadUserPwd)
-          return
-      else:
-        if pass == "" or
-            pass[0 .. 59] != makePassword(ctx.password,
-                pass[60 .. pass.len - 1], pass[0 .. 59]):
-          await denyConnect(ctx, ConnRefBadUserPwd)
-          return
+      if pass == "" or not verifyPassword(ctx.password, pass):
+        await denyConnect(ctx, ConnRefBadUserPwd)
+        return
     # 3.1.2.2 Protocol Level
     if ctx.proto != "MQTT":
       await denyConnect(ctx, ConnRefProtocol)
@@ -1081,9 +1140,7 @@ proc onConnect(ctx: MqttCtx, pkt: Pkt) {.async.} =
       verbose("Connections >> " & ctx.clientId & " has connected")
     if mqttbroker.verbosity >= 3:
       verbose(ctx)
-    ctx.workQueue[0.uint16] = newWork(wk = PubWork, flags = ConnAcc.uint16,
-        state = WorkNew, typ = ConnAck)
-    await ctx.work()
+    discard await ctx.sendConnAck(ConnAcc.uint16)
 
 # ------------------------------------------------------------------------------
 #
@@ -1283,23 +1340,26 @@ proc onSubscribe(ctx: MqttCtx, pkt: Pkt) {.async.} =
       (qos, offset)     = pkt.getu8(offset)
       ctx.subscribed[topic] = qos
       await addSubscriber(ctx, topic)
-    ctx.workQueue[msgId] = newWork(wk = PubWork, msgId = msgId, state = WorkNew,
+    let subAckWork = newWork(wk = PubWork, msgId = msgId, state = WorkNew,
         qos = 0, typ = SubAck)
+    discard ctx.workQueue.enqueue(subAckWork)
     # Send retained messaged for #
     if topic == "#":
       for top, ret in mqttbroker.retained:
         let
           msgId = ctx.nextMsgId()
           qosRet = qosAlign(qos, ret.qos)
-        ctx.workQueue[msgId] = newWork(wk = PubWork, msgId = msgId, topic = top,
+        let retainedWork = newWork(wk = PubWork, msgId = msgId, topic = top,
             qos = qosRet, message = ret.msg, typ = Publish)
+        discard ctx.workQueue.enqueue(retainedWork)
     # Send retained messaged for specific topic
     elif mqttbroker.retained.hasKey(topic):
       let
         msgId = ctx.nextMsgId()
         qosRet = qosAlign(qos, mqttbroker.retained[topic].qos)
-      ctx.workQueue[msgId] = newWork(wk = PubWork, msgId = msgId, topic = topic,
+      let retainedWork = newWork(wk = PubWork, msgId = msgId, topic = topic,
           qos = qosRet, message = mqttbroker.retained[topic].msg, typ = Publish)
+      discard ctx.workQueue.enqueue(retainedWork)
     if mqttbroker.verbosity >= 1:
       verbose("Client      >> " & ctx.clientId & " has subscribed to a topic")
       verbose("Subscribers", mqttbroker.subscribers)
@@ -1352,8 +1412,9 @@ proc onUnsubscribe(ctx: MqttCtx, pkt: Pkt) {.async.} =
     if mqttbroker.verbosity >= 1:
       verbose("Client      >> " & ctx.clientId & " has unsubscribed from a topic")
       verbose("Subscribers", mqttbroker.subscribers)
-    ctx.workQueue[msgId] = newWork(wk = PubWork, msgId = msgId, state = WorkNew,
+    let unsubAckWork = newWork(wk = PubWork, msgId = msgId, state = WorkNew,
         qos = 0, typ = UnsubAck)
+    discard ctx.workQueue.enqueue(unsubAckWork)
     await ctx.work()
 
 # ------------------------------------------------------------------------------
@@ -1394,7 +1455,7 @@ proc onPingReq(ctx: MqttCtx, pkt: Pkt) {.async.} =
     ctx.wrn "Packet type only supported for broker: " & $pkt.typ
   else:
     var msgId = ctx.nextMsgId() + 1000
-    while ctx.workQueue.hasKey(msgId):
+    while ctx.workQueue.contains(msgId):
       msgId += 1000
     let work = newWork(wk = PubWork, msgId = msgId, state = WorkNew, qos = 0,
         typ = PingResp)
@@ -1453,47 +1514,63 @@ proc handle(ctx: MqttCtx, pkt: Pkt) {.async.} =
 # ------------------------------------------------------------------------------
 #
 # ------------------------------------------------------------------------------
-proc runRx(ctx: MqttCtx) {.async.} =
+proc runRx(ctx: MqttCtx, transport: AsyncSocket) {.async.} =
   try:
-    while true:
-      let pkt = await ctx.recv()
+    while ctx.isActiveReceiveTransport(transport):
+      let pkt = await ctx.recv(transport)
       if pkt.isNil or pkt.typ == Notype:
-        ctx.info("! [MQTT] runRx: socket disconnected.")
+        if ctx.isActiveReceiveTransport(transport):
+          ctx.info("! [MQTT] runRx: socket disconnected.")
+        break
+      if not ctx.isActiveReceiveTransport(transport):
         break
       await ctx.handle(pkt)
-      if ctx.state notin [Connecting, Connected]:
-        break
   except CatchableError:
-    if ctx.verbosity >= 2:
+    if ctx.isActiveReceiveTransport(transport) and ctx.verbosity >= 2:
       let err = getCurrentExceptionMsg()
       ctx.wrn(&"runRx: receive failed, \"{err}\"")
   finally:
-    ctx.cleanupDisconnectedTransport()
+    ctx.cleanupDisconnectedTransport(transport)
 
 # ------------------------------------------------------------------------------
 #
 # ------------------------------------------------------------------------------
-proc runConnAckTimeout(ctx: MqttCtx, workerId: int) {.async.} =
+proc runConnAckTimeout(
+    ctx: MqttCtx,
+    workerId: int,
+    generation: int,
+    transport: AsyncSocket,
+) {.async.} =
   await sleepAsync(ctx.connAckTimeoutMs)
 
-  # A newer connection attempt, a successful CONNACK, or an explicit
-  # disconnect makes this watchdog stale. Only the matching connection that
-  # is still waiting in Connecting is allowed to trigger recovery.
-  if ctx.pingWorkerId != workerId or ctx.state != Connecting:
+  # A newer lifecycle, connection attempt, successful CONNACK, or explicit
+  # disconnect makes this watchdog stale. Only the exact connection that is
+  # still waiting in Connecting is allowed to trigger recovery.
+  if not ctx.isCurrentLifecycle(generation) or
+      ctx.pingWorkerId != workerId or
+      ctx.s != transport or
+      ctx.state != Connecting:
     return
 
   ctx.registerReconnectFailure(
     &"CONNACK timeout after {ctx.connAckTimeoutMs} ms"
   )
-  ctx.cleanupDisconnectedTransport()
+  ctx.cleanupDisconnectedTransport(transport)
 
 # ------------------------------------------------------------------------------
 #
 # ------------------------------------------------------------------------------
-proc runPing(ctx: MqttCtx, workerId: int) {.async.} =
+proc runPing(
+    ctx: MqttCtx,
+    workerId: int,
+    generation: int,
+    transport: AsyncSocket,
+) {.async.} =
   while true:
     await sleepAsync(ctx.keepAlive.int * 1000)
-    if ctx.pingWorkerId != workerId:
+    if not ctx.isCurrentLifecycle(generation):
+      break
+    if ctx.pingWorkerId != workerId or ctx.s != transport:
       ctx.warning("! [MQTT] runPing: re-connected, stop this worker.")
       break
     if ctx.state == Connecting:
@@ -1505,33 +1582,53 @@ proc runPing(ctx: MqttCtx, workerId: int) {.async.} =
       # the keepalive response lost. This avoids a false timeout when PINGRESP
       # becomes readable at nearly the same instant as this worker wakes up.
       await sleepAsync(PingResponseGraceMs)
-      if ctx.pingWorkerId != workerId or ctx.state != Connected:
+      if not ctx.isCurrentLifecycle(generation) or
+          ctx.pingWorkerId != workerId or
+          ctx.s != transport or
+          ctx.state != Connected:
         break
       if ctx.pingOutstanding:
         ctx.warning("! [MQTT] runPing: PINGRESP timeout, reconnecting.")
-        ctx.cleanupDisconnectedTransport()
+        ctx.cleanupDisconnectedTransport(transport)
         break
       continue
     let ok = await ctx.sendPingReq()
     if not ok:
       ctx.warning("! [MQTT] runPing: sendPingReq failed.")
-      ctx.cleanupDisconnectedTransport()
+      ctx.cleanupDisconnectedTransport(transport)
       break
     ctx.pingOutstanding = true
 
 # ------------------------------------------------------------------------------
 #
 # ------------------------------------------------------------------------------
-proc connectBroker(ctx: MqttCtx) {.async.} =
-  ## Connect to the broker
+proc connectBroker(ctx: MqttCtx, generation: int) {.async.} =
+  ## Connect to the broker for one lifecycle generation.
+  ##
+  ## TCP dial completes into a local transport first. A stale dial is closed
+  ## before it can replace ctx.s, which prevents an older start/reconnect worker
+  ## from taking ownership of a newer lifecycle.
+  if not ctx.isCurrentLifecycle(generation):
+    return
+
   if ctx.keepAlive == 0:
     ctx.keepAlive = 60
   ctx.info(&"[MQTT] Connecting to {ctx.host}:{ctx.port}...")
   ctx.state = Error # set to Connecting by sendConnect
   ctx.updatePublishState()
 
+  var transport: AsyncSocket
+
   try:
-    ctx.s = await asyncnet.dial(ctx.host, ctx.port)
+    transport = await asyncnet.dial(ctx.host, ctx.port)
+
+    if not ctx.isCurrentLifecycle(generation):
+      if not transport.isNil and not transport.isClosed():
+        transport.close()
+      return
+
+    ctx.s = transport
+
     if ctx.sslOn:
       when defined(ssl):
         ctx.destroySslContext()
@@ -1553,27 +1650,56 @@ proc connectBroker(ctx: MqttCtx) {.async.} =
         if ctx.sslCaFile.len > 0:
           wrapConnectedSocket(
             ctx.ssl,
-            ctx.s,
+            transport,
             handshakeAsClient,
             hostname = ctx.host,
           )
           ctx.setSslExpectedPeer()
         else:
-          wrapConnectedSocket(ctx.ssl, ctx.s, handshakeAsClient)
+          wrapConnectedSocket(ctx.ssl, transport, handshakeAsClient)
       else:
         ctx.wrn "Requested SSL session but ssl is not enabled"
         await ctx.close("SSL not enabled")
 
+    if not ctx.isCurrentLifecycle(generation):
+      ctx.cleanupFailedConnection(transport)
+      return
+
     let ok = await ctx.sendConnect()
-    if ok:
+
+    if not ctx.isCurrentLifecycle(generation):
+      ctx.cleanupFailedConnection(transport)
+      return
+
+    if ok and ctx.s == transport:
       ctx.pingWorkerId.inc()
       ctx.info(&"[MQTT] CONNECT sent, start async tasks, pingWorkerId: {ctx.pingWorkerId}")
-      asyncCheck ctx.runRx()
-      asyncCheck ctx.runConnAckTimeout(ctx.pingWorkerId)
-      asyncCheck ctx.runPing(ctx.pingWorkerId)
+      asyncCheck ctx.runRx(transport)
+      asyncCheck ctx.runConnAckTimeout(
+        ctx.pingWorkerId,
+        generation,
+        transport,
+      )
+      asyncCheck ctx.runPing(
+        ctx.pingWorkerId,
+        generation,
+        transport,
+      )
 
   except CatchableError:
-    ctx.cleanupFailedConnection()
+    let current = ctx.isCurrentLifecycle(generation)
+
+    if not transport.isNil:
+      ctx.cleanupFailedConnection(transport)
+    elif current:
+      ctx.cleanupFailedConnection()
+
+    # A stale connection attempt is expected to fail if disconnect() closed its
+    # transport. It must not overwrite the state or reconnect policy belonging
+    # to the newer lifecycle.
+    if not current:
+      return
+
     ctx.state = Error
     ctx.updatePublishState()
     raise
@@ -1626,9 +1752,9 @@ proc restoreSubscriptions(ctx: MqttCtx) =
 # ------------------------------------------------------------------------------
 #
 # ------------------------------------------------------------------------------
-proc runConnect(ctx: MqttCtx) {.async.} =
-  ## Auto-connect and reconnect to broker
-  while true:
+proc runConnect(ctx: MqttCtx, generation: int) {.async.} =
+  ## Auto-connect and reconnect to broker for one lifecycle generation.
+  while ctx.isCurrentLifecycle(generation):
     if ctx.state == Disabled:
       break
 
@@ -1637,6 +1763,8 @@ proc runConnect(ctx: MqttCtx) {.async.} =
       if remainingDelayMs > 0:
         await sleepAsync(remainingDelayMs)
 
+        if not ctx.isCurrentLifecycle(generation):
+          break
         if ctx.state == Disabled:
           break
         if ctx.state notin [Disconnected, Error]:
@@ -1645,9 +1773,14 @@ proc runConnect(ctx: MqttCtx) {.async.} =
       ctx.clearReconnectDelay()
 
       try:
-        await ctx.connectBroker()
+        await ctx.connectBroker(generation)
       except CatchableError:
+        if not ctx.isCurrentLifecycle(generation):
+          break
         ctx.registerReconnectFailure(getCurrentExceptionMsg())
+
+      if not ctx.isCurrentLifecycle(generation):
+        break
 
       # Restore transport-dependent queued work after a reconnect. Pending QoS
       # publishes must be eligible for immediate retransmission, while
@@ -1774,7 +1907,8 @@ proc setVerbosity*(ctx: MqttCtx, verbosity: int) =
 # ------------------------------------------------------------------------------
 proc connect*(ctx: MqttCtx) {.async.} =
   ## Connect to the broker.
-  await ctx.connectBroker()
+  let generation = ctx.nextLifecycleGeneration()
+  await ctx.connectBroker(generation)
 
 # ------------------------------------------------------------------------------
 #
@@ -1784,15 +1918,18 @@ proc start*(ctx: MqttCtx) {.async.} =
   ## reconnect when the state is `Disconnected` or `Error`. The `Error`-state
   ## happens, when the broker is down, but the client will try to reconnect
   ## until the broker is up again.
+  let generation = ctx.nextLifecycleGeneration()
   ctx.state = Disconnected
   ctx.updatePublishState()
-  asyncCheck ctx.runConnect()
+  asyncCheck ctx.runConnect(generation)
 
 # ------------------------------------------------------------------------------
 #
 # ------------------------------------------------------------------------------
 proc disconnect*(ctx: MqttCtx) {.async.} =
-  ## Disconnect from the broker.
+  ## Disconnect from the broker and invalidate workers from this lifecycle
+  ## before closing the transport.
+  discard ctx.nextLifecycleGeneration()
   await ctx.close("disconnect", disable = true)
 
 # ------------------------------------------------------------------------------
