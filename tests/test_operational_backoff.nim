@@ -11,6 +11,7 @@ import ../nmqtt_ng
 const
   TestTimeoutMs = 8000
 
+
 type
   TestBroker = ref object
     listener: AsyncSocket
@@ -64,21 +65,69 @@ proc recvPacket(socket: AsyncSocket): Future[(uint8, string)] {.async.} =
 # ------------------------------------------------------------------------------
 #
 # ------------------------------------------------------------------------------
+proc publishMsgId(fixedHeader: uint8, body: string): uint16 =
+  let qos = (fixedHeader shr 1) and 0x03
+  if qos == 0:
+    raise newException(ValueError, "PUBLISH packet does not contain a message ID")
+
+  if body.len < 4:
+    raise newException(ValueError, "PUBLISH packet is too short")
+
+  let topicLength = (body[0].uint8.uint16 shl 8) or body[1].uint8.uint16
+  let msgIdOffset = 2 + topicLength.int
+
+  if body.len < msgIdOffset + 2:
+    raise newException(ValueError, "PUBLISH packet does not contain a complete message ID")
+
+  result =
+    (body[msgIdOffset].uint8.uint16 shl 8) or
+    body[msgIdOffset + 1].uint8.uint16
+
+# ------------------------------------------------------------------------------
+#
+# ------------------------------------------------------------------------------
+proc sendPubAck(client: AsyncSocket, msgId: uint16) {.async.} =
+  var pubAck = newString(4)
+  pubAck[0] = 0x40.char
+  pubAck[1] = 0x02.char
+  pubAck[2] = (msgId shr 8).uint8.char
+  pubAck[3] = (msgId and 0xff).uint8.char
+  await client.send(pubAck)
+
+# ------------------------------------------------------------------------------
+#
+# ------------------------------------------------------------------------------
 proc handleClient(client: AsyncSocket, connectionNumber: int) {.async.} =
   try:
     let (connectHeader, _) = await client.recvPacket()
     if (connectHeader shr 4) != 1:
       raise newException(ValueError, "expected MQTT CONNECT packet")
 
-    # MQTT 3.1.1 CONNACK: session present = 0, return code = accepted.
     await client.send("\x20\x02\x00\x00")
 
-    if connectionNumber <= 2:
-      # A successful CONNACK alone must not reset reconnect backoff. Simulate
-      # two broker/network-side disconnects before any acknowledged publish or
-      # subscription exchange has completed.
+    if connectionNumber == 1:
+      # The first connection becomes Connected but performs no acknowledged
+      # MQTT exchange. Its disconnect therefore advances reconnect backoff.
       await sleepAsync(100)
       return
+
+    if connectionNumber == 2:
+      # A valid QoS 1 PUBACK proves that the MQTT session is operational. The
+      # following disconnect must therefore restart backoff from one second.
+      while true:
+        let (fixedHeader, body) = await client.recvPacket()
+        case fixedHeader shr 4
+        of 3:
+          let msgId = publishMsgId(fixedHeader, body)
+          await client.sendPubAck(msgId)
+          await sleepAsync(100)
+          return
+        of 12:
+          await client.send("\xD0\x00")
+        of 14:
+          return
+        else:
+          discard
 
     while true:
       let (fixedHeader, _) = await client.recvPacket()
@@ -143,7 +192,7 @@ proc stop(broker: TestBroker) =
 # ------------------------------------------------------------------------------
 proc waitUntil(
     predicate: proc(): bool,
-    timeoutMs = TestTimeoutMs
+    timeoutMs = TestTimeoutMs,
 ): Future[bool] {.async.} =
   var elapsed = 0
 
@@ -156,14 +205,14 @@ proc waitUntil(
 
   result = predicate()
 
-suite "Automatic reconnect regression":
-  test "reconnects after an established broker connection is closed":
+suite "Operational session reconnect backoff regression":
+  test "PUBACK resets reconnect backoff after a usable MQTT session":
     proc run() {.async.} =
       let broker = newTestBroker()
       defer:
         broker.stop()
 
-      let ctx = newMqttCtx("nmqttReconnectRegression")
+      let ctx = newMqttCtx("nmqttOperationalBackoffRegression")
       ctx.setHost("127.0.0.1", broker.port.int)
 
       var connectedEvents = 0
@@ -176,17 +225,25 @@ suite "Automatic reconnect regression":
 
       await ctx.start()
 
+      check await waitUntil(proc(): bool = connectedEvents >= 2)
+
+      await ctx.publish(
+        topic = "test/operational",
+        message = "payload",
+        qos = 1,
+      )
+
       check await waitUntil(proc(): bool = broker.connectionCount >= 3)
-      check await waitUntil(proc(): bool = connectedEvents >= 3)
-      check ctx.isConnected()
+      check await waitUntil(proc(): bool = ctx.isConnected())
       check broker.connectionTimes.len >= 3
 
       let
         firstRetryDelay = broker.connectionTimes[1] - broker.connectionTimes[0]
-        secondRetryDelay = broker.connectionTimes[2] - broker.connectionTimes[1]
+        operationalRetryDelay = broker.connectionTimes[2] - broker.connectionTimes[1]
 
       check firstRetryDelay >= 0.8
-      check secondRetryDelay >= 1.8
+      check operationalRetryDelay >= 0.8
+      check operationalRetryDelay < 1.8
 
       await ctx.disconnect()
 

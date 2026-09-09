@@ -61,6 +61,7 @@ type
     pingOutstanding: bool
     connAckTimeoutMs: int
     reconnectPolicy: ReconnectPolicy
+    sessionOperational: bool
     reconnectDelayStartedAt: MonoTime
     reconnectDelayMs: int
     pubCallbacks: Table[string, PubCallback]
@@ -525,6 +526,21 @@ proc clearReconnectDelay(ctx: MqttCtx) =
 # ------------------------------------------------------------------------------
 #
 # ------------------------------------------------------------------------------
+proc markSessionOperational(ctx: MqttCtx) =
+  ## Reset reconnect backoff only after the MQTT session has completed a
+  ## broker-confirmed exchange. A successful CONNACK alone is not enough: the
+  ## broker may still close the connection immediately because of application
+  ## policy or another post-CONNECT condition.
+  if ctx.sessionOperational:
+    return
+
+  ctx.sessionOperational = true
+  ctx.reconnectPolicy.reset()
+  ctx.clearReconnectDelay()
+
+# ------------------------------------------------------------------------------
+#
+# ------------------------------------------------------------------------------
 proc cleanupFailedConnection(
     ctx: MqttCtx,
     transport: AsyncSocket = nil,
@@ -740,6 +756,7 @@ proc recv(ctx: MqttCtx, transport: AsyncSocket): Future[Pkt] {.async.} =
 # ------------------------------------------------------------------------------
 proc sendConnect(ctx: MqttCtx): Future[bool] =
   ctx.info("[MQTT] sendConnect")
+  ctx.sessionOperational = false
   var flags: uint8
   flags = flags or CleanSession.uint8
   if ctx.willFlag:
@@ -1159,8 +1176,6 @@ proc onConnAck(ctx: MqttCtx, pkt: Pkt): Future[void] {.async.} =
   ctx.pingOutstanding = false
   ctx.updatePublishState()
   ctx.beenConnected = true
-  ctx.reconnectPolicy.reset()
-  ctx.clearReconnectDelay()
   ctx.info("[MQTT] onConnAck: connection established")
   await ctx.work()
 
@@ -1266,6 +1281,7 @@ proc onPubAck(ctx: MqttCtx, pkt: Pkt) {.async.} =
       ctx.wrn(&"onPubAck: unexpected work for msgId {msgId}: {work.typ}")
       return
 
+    ctx.markSessionOperational()
     discard ctx.workQueue.remove(msgId)
     ctx.updatePublishState()
     if ctx.workCallback.isSome:
@@ -1315,6 +1331,7 @@ proc onPubComp(ctx: MqttCtx, pkt: Pkt) {.async.} =
   if workOpt.isSome:
     let work = workOpt.get()
     if work.wk == PubWork and work.qos == 2 and work.typ == PubRel:
+      ctx.markSessionOperational()
       discard ctx.workQueue.remove(msgId)
       ctx.updatePublishState()
 
@@ -1374,6 +1391,7 @@ proc onSubAck(ctx: MqttCtx, pkt: Pkt) {.async.} =
     (returnCode, _) = pkt.getu8(offset)
   ctx.info(&"[MQTT] onSubAck: msgId: {msgId}, returnCode: {returnCode}")
 
+  var expectedSubscription = false
   let workOpt = ctx.workQueue.get(msgId)
   if workOpt.isSome:
     let work = workOpt.get()
@@ -1381,6 +1399,7 @@ proc onSubAck(ctx: MqttCtx, pkt: Pkt) {.async.} =
       ctx.wrn(&"onSubAck: unexpected work for msgId {msgId}: {work.typ}")
       return
 
+    expectedSubscription = true
     discard ctx.workQueue.remove(msgId)
     ctx.updatePublishState()
 
@@ -1388,6 +1407,8 @@ proc onSubAck(ctx: MqttCtx, pkt: Pkt) {.async.} =
     ctx.error(&"! [MQTT] subscription rejected for msgId {msgId}")
   elif returnCode > 2'u8:
     ctx.wrn(&"onSubAck: invalid return code {returnCode} for msgId {msgId}")
+  elif expectedSubscription:
+    ctx.markSessionOperational()
 
 # ------------------------------------------------------------------------------
 #
@@ -1468,6 +1489,7 @@ proc onPingReq(ctx: MqttCtx, pkt: Pkt) {.async.} =
 proc onPingResp(ctx: MqttCtx, pkt: Pkt) {.async.} =
   ctx.info("[MQTT] onPingResp")
   ctx.pingOutstanding = false
+  ctx.markSessionOperational()
 
 # ------------------------------------------------------------------------------
 #
@@ -1521,14 +1543,17 @@ proc runRx(ctx: MqttCtx, transport: AsyncSocket) {.async.} =
       if pkt.isNil or pkt.typ == Notype:
         if ctx.isActiveReceiveTransport(transport):
           ctx.info("! [MQTT] runRx: socket disconnected.")
+          ctx.registerReconnectFailure("socket disconnected")
         break
       if not ctx.isActiveReceiveTransport(transport):
         break
       await ctx.handle(pkt)
   except CatchableError:
-    if ctx.isActiveReceiveTransport(transport) and ctx.verbosity >= 2:
+    if ctx.isActiveReceiveTransport(transport):
       let err = getCurrentExceptionMsg()
-      ctx.wrn(&"runRx: receive failed, \"{err}\"")
+      if ctx.verbosity >= 2:
+        ctx.wrn(&"runRx: receive failed, \"{err}\"")
+      ctx.registerReconnectFailure(&"receive failed: {err}")
   finally:
     ctx.cleanupDisconnectedTransport(transport)
 
@@ -1589,12 +1614,14 @@ proc runPing(
         break
       if ctx.pingOutstanding:
         ctx.warning("! [MQTT] runPing: PINGRESP timeout, reconnecting.")
+        ctx.registerReconnectFailure("PINGRESP timeout")
         ctx.cleanupDisconnectedTransport(transport)
         break
       continue
     let ok = await ctx.sendPingReq()
     if not ok:
       ctx.warning("! [MQTT] runPing: sendPingReq failed.")
+      ctx.registerReconnectFailure("PINGREQ send failed")
       ctx.cleanupDisconnectedTransport(transport)
       break
     ctx.pingOutstanding = true
